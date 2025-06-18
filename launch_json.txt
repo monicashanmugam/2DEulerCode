@@ -1,0 +1,26 @@
+Update launch.json (if needed)
+If you want “Run and Debug” (F5) to run that mySolver executable, open .vscode/launch.json and ensure "program" points to "${workspaceFolder}/mySolver". For example:
+
+jsonc
+Copy
+Edit
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "g++ Launch",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/mySolver",
+      "args": [],
+      "stopAtEntry": false,
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "externalConsole": false,
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb",
+      "preLaunchTask": "g++ build all"
+    }
+  ]
+}
+Now, when you press F5, VS Code will first run the “g++ build all” task, then launch ./mySolver under the debugger.

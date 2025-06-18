@@ -1,0 +1,99 @@
+// // global limits for Primitive variables
+// const double RHO_MIN = 1e-3;
+// const double RHO_MAX = 5.0;
+
+// const double U_MIN   = -1000.0;  // velocity u min
+// const double U_MAX   = 2000.0;   // velocity u max
+// const double V_MIN   = -1000.0;  // velocity v min  
+// const double V_MAX   = 2000.0;   // velocity v max
+
+// const double P_MIN   = 1e-8;
+// const double P_MAX   = 1.0e6;
+
+
+// // Global Limits for conserved variables:
+// const double U1_MIN = RHO_MIN * 0.5;
+// const double U1_MAX = RHO_MAX * 2.0;
+
+// const double U2_MIN = RHO_MIN * U_MIN * 2.0;   // for rho*u
+// const double U2_MAX = RHO_MAX * U_MAX * 2.0;
+
+// const double U3_MIN = RHO_MIN * V_MIN * 2.0;   // for rho*v (new)
+// const double U3_MAX = RHO_MAX * V_MAX * 2.0;
+
+// const double U4_MIN = P_MIN / (gamma_ - 1.0);  // energy
+// const double U4_MAX = P_MAX / (gamma_ - 1.0) + 0.5 * RHO_MAX * (U_MAX*U_MAX + V_MAX*V_MAX);
+
+
+// void ApplyLimitsToPrimitive() {
+//     int ni = V.size();
+//     if (ni == 0) return;
+//     int nj = V[0].size();
+
+//     for (int i = 0; i < ni; i++) {
+//         for (int j = 0; j < nj; j++) {
+//             // Save old values for comparison
+//             double old_rho = V[i][j].rho;
+//             double old_u   = V[i][j].u;
+//             double old_v   = V[i][j].v;   // new
+//             double old_P   = V[i][j].P;
+
+//             // Clamp
+//             V[i][j].rho = std::min(RHO_MAX, std::max(RHO_MIN, V[i][j].rho));
+//             V[i][j].u   = std::min(U_MAX,   std::max(U_MIN,   V[i][j].u));
+//             V[i][j].v   = std::min(V_MAX,   std::max(V_MIN,   V[i][j].v));   // new
+//             V[i][j].P   = std::min(P_MAX,   std::max(P_MIN,   V[i][j].P));
+
+//             // Compare after clamping
+//             if (V[i][j].rho != old_rho) {
+//                 std::cerr << "[WARNING] Clamped density in cell (" << i << "," << j << ")" << std::endl;
+//             }
+//             if (V[i][j].u != old_u) {
+//                 std::cerr << "[WARNING] Clamped u-velocity in cell (" << i << "," << j << ")" << std::endl;
+//             }
+//             if (V[i][j].v != old_v) {
+//                 std::cerr << "[WARNING] Clamped v-velocity in cell (" << i << "," << j << ")" << std::endl;
+//             }
+//             if (V[i][j].P != old_P) {
+//                 std::cerr << "[WARNING] Clamped pressure in cell (" << i << "," << j << ")" << std::endl;
+//             }
+//         }
+//     }
+// }
+
+
+// void ApplyLimitsToConserved() {
+//     int ni = U.size();
+//     if (ni == 0) return;
+//     int nj = U[0].size();
+
+//     for (int i = 0; i < ni; i++) {
+//         for (int j = 0; j < nj; j++) {
+//             // Save old values for comparison
+//             double old_rho  = U[i][j].rho;
+//             double old_rhou = U[i][j].rhou;
+//             double old_rhov = U[i][j].rhov;   // new
+//             double old_E    = U[i][j].E;
+
+//             // Clamp
+//             U[i][j].rho  = std::min(U1_MAX, std::max(U1_MIN, U[i][j].rho));
+//             U[i][j].rhou = std::min(U2_MAX, std::max(U2_MIN, U[i][j].rhou));
+//             U[i][j].rhov = std::min(U3_MAX, std::max(U3_MIN, U[i][j].rhov));  // new
+//             U[i][j].E    = std::min(U4_MAX, std::max(U4_MIN, U[i][j].E));     // note: you need U4_MAX/U4_MIN for energy
+
+//             // Print warnings
+//             if (U[i][j].rho != old_rho) {
+//                 std::cerr << "[WARNING] Clamped conserved density in cell (" << i << "," << j << ")" << std::endl;
+//             }
+//             if (U[i][j].rhou != old_rhou) {
+//                 std::cerr << "[WARNING] Clamped conserved momentum-x in cell (" << i << "," << j << ")" << std::endl;
+//             }
+//             if (U[i][j].rhov != old_rhov) {
+//                 std::cerr << "[WARNING] Clamped conserved momentum-y in cell (" << i << "," << j << ")" << std::endl;
+//             }
+//             if (U[i][j].E != old_E) {
+//                 std::cerr << "[WARNING] Clamped conserved energy in cell (" << i << "," << j << ")" << std::endl;
+//             }
+//         }
+//     }
+// }
