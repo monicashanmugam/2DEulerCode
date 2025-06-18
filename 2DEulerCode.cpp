@@ -115,7 +115,7 @@ Conserved PrimitiveToConserved(const Primitive &Vcell) {
     Conserved Ucell;
     Ucell.rho  = Vcell.rho;
     Ucell.rhou = Vcell.rho * Vcell.u;
-    Ucell.rhov = Vcell.rho * Vcell.v;  // new
+    Ucell.rhov = Vcell.rho * Vcell.v;  
     Ucell.E    = E_vol;
     return Ucell;
 }
@@ -178,7 +178,7 @@ void GlobalPrimitiveToConserved() {
     // ApplyLimitsToConserved();
 }
 
-// Define (but don't yet size) the eight geometry arrays:
+// Define the eight geometry arrays:
 std::vector<std::vector<double>> x_cell;
 std::vector<std::vector<double>> y_cell;
 std::vector<std::vector<double>> A_face_i;
@@ -371,22 +371,222 @@ inline void convertToCartesianDebug(
     ny_face_j.assign(Ni,   std::vector<double>(Nj+1, +1.0));
 }
 
+//----------------------------------------------------------------------
+// (A) Define supersonic and subsonic MMS constants
+//----------------------------------------------------------------------
+
+// Constants for MMS field construction
+struct MmsParams {
+    double rho0,   rho_x,   rho_y,   a_rho_x, a_rho_y;
+    double u0,     u_x,     u_y,     a_u_x,   a_u_y;
+    double v0,     v_x,     v_y,     a_v_x,   a_v_y;
+    double p0,     p_x,     p_y,     a_p_x,   a_p_y;
+};
+
+// Supersonic constants (MMS case 1)
+constexpr MmsParams mmsSup = {
+    1.0,   0.15,  -0.10,  1.0,    0.50,       // rho
+    800.0, 50.0, -30.0,  1.5,    0.60,       // u
+    800.0, -75.0, 40.0,  0.5,    (2.0 / 3.0),// v
+    100000.0, 20000.0, 50000.0, 2.0, 1.0     // p
+};
+
+// Subsonic constants (MMS case 2)
+constexpr MmsParams mmsSub = {
+    1.0,   0.15,  -0.10,  1.0,   0.50,       // rho
+    70.0,  5.0,   -7.0,  1.5,   0.60,       // u
+    90.0, -15.0,   8.5,  0.5,   (2.0 / 3.0),// v
+    100000.0, 20000.0, 50000.0, 2.0, 1.0     // p
+};
+
+// Shared constant for π
+constexpr double PI = std::acos(-1.0);
 
 
-//---------------------------------------------------------------------
-// ComputeTimeStep:
-// Compute the time step based on the CFL condition.
-//---------------------------------------------------------------------
-double ComputeTimeStep() {
-    double dx = (xmax - xmin) / imax;
-    double dt_min = 1.0e20;
-    for (int i = ghost; i < ghost + imax; i++) {
-        double a = sqrt(gamma_ * V[i].P / V[i].rho);
-        double speed = fabs(V[i].u) + a;
-        dt_min = min(dt_min, CFL * dx / speed);
-    }
-    return dt_min;
+double rho_mms(int mmsCase, double L, double x, double y) {
+  assert(mmsCase == 1 || mmsCase == 2);
+  const auto& C = (mmsCase == 1 ? mmsSup : mmsSub);
+
+  double xi = x / L;
+  double eta = y / L;
+  double lin = C.rho0 + C.rho_x * xi + C.rho_y * eta;
+  double sin_term = C.a_rho_x * std::sin(PI * xi)
+                  + C.a_rho_y * std::sin(PI * eta);
+  return lin + sin_term;
 }
+
+double uvel_mms(int mmsCase, double L, double x, double y) {
+  assert(mmsCase == 1 || mmsCase == 2);
+  const auto& C = (mmsCase == 1 ? mmsSup : mmsSub);
+
+  double xi = x / L;
+  double eta = y / L;
+  double lin = C.u0 + C.u_x * xi + C.u_y * eta;
+  double sin_term = C.a_u_x * std::sin(PI * xi)
+                  + C.a_u_y * std::sin(PI * eta);
+  return lin + sin_term;
+}
+
+double vvel_mms(int mmsCase, double L, double x, double y) {
+  assert(mmsCase == 1 || mmsCase == 2);
+  const auto& C = (mmsCase == 1 ? mmsSup : mmsSub);
+
+  double xi = x / L;
+  double eta = y / L;
+  double lin = C.v0 + C.v_x * xi + C.v_y * eta;
+  double sin_term = C.a_v_x * std::sin(PI * xi)
+                  + C.a_v_y * std::sin(PI * eta);
+  return lin + sin_term;
+}
+
+double press_mms(int mmsCase, double L, double x, double y) {
+  assert(mmsCase == 1 || mmsCase == 2);
+  const auto& C = (mmsCase == 1 ? mmsSup : mmsSub);
+
+  double xi = x / L;
+  double eta = y / L;
+  double lin = C.p0 + C.p_x * xi + C.p_y * eta;
+  double sin_term = C.a_p_x * std::sin(PI * xi)
+                  + C.a_p_y * std::sin(PI * eta);
+  return lin + sin_term;
+}
+
+
+//Initialize the cells with the exact solution from MMS
+
+void initializeMMS(int mmsCase, double L,
+                   const std::vector<std::vector<double>>& x_cell,
+                   const std::vector<std::vector<double>>& y_cell,
+                   std::vector<std::vector<Conserved>>& U,
+                   std::vector<std::vector<Primitive>>& V) {
+    
+    int Ni = imax + 2 * ghost;
+    int Nj = jmax + 2 * ghost;
+
+    // Resize primitive array
+    V.assign(Ni, std::vector<Primitive>(Nj));
+
+    // Step 1: Fill Primitive Variables
+    for (int i = 0; i < Ni; ++i) {
+        for (int j = 0; j < Nj; ++j) {
+            double x = x_cell[i][j];
+            double y = y_cell[i][j];
+
+            Primitive Vcell;
+            Vcell.rho = rho_mms(mmsCase, L, x, y);
+            Vcell.u   = uvel_mms(mmsCase, L, x, y);
+            Vcell.v   = vvel_mms(mmsCase, L, x, y);
+            Vcell.P   = press_mms(mmsCase, L, x, y);
+            V[i][j] = Vcell;
+        }
+    }
+
+    // Step 2: Use your pre-defined function to convert to Conserved
+    GlobalPrimitiveToConserved();
+
+    std::cout << "[INFO] Initialized MMS primitive + conserved.\n";
+}
+
+void applyBoundaryConditions(
+    std::vector<std::vector<Conserved>> &U,
+    std::vector<std::vector<Primitive>> &V,
+    int mmsCase,
+    double L,
+    const std::vector<std::vector<double>> &x_cell,
+    const std::vector<std::vector<double>> &y_cell
+) {
+    int ni = imax + 2 * ghost;
+    int nj = jmax + 2 * ghost;
+
+    for (int i = 0; i < ni; ++i) {
+        for (int j = 0; j < nj; ++j) {
+            if (i >= ghost && i < ghost + imax && j >= ghost && j < ghost + jmax) continue;
+
+            double x = x_cell[i][j];
+            double y = y_cell[i][j];
+
+            Primitive Vcell;
+            Vcell.rho = rho_mms(mmsCase, L, x, y);
+            Vcell.u   = uvel_mms(mmsCase, L, x, y);
+            Vcell.v   = vvel_mms(mmsCase, L, x, y);
+            Vcell.P   = press_mms(mmsCase, L, x, y);
+
+            Conserved Ucell = PrimitiveToConserved(Vcell);
+
+            V[i][j] = Vcell;
+            U[i][j] = Ucell;
+        }
+    }
+}
+
+double computeTimeStep(
+    const std::vector<std::vector<Primitive>>& V,
+    const std::vector<std::vector<double>>& cellVolume,
+    const std::vector<std::vector<double>>& A_face_i,
+    const std::vector<std::vector<double>>& A_face_j,
+    const std::vector<std::vector<double>>& nx_face_i,
+    const std::vector<std::vector<double>>& ny_face_i,
+    const std::vector<std::vector<double>>& nx_face_j,
+    const std::vector<std::vector<double>>& ny_face_j
+) {
+    double dtMin = 1e10;
+
+    for (int i = ghost; i < imax + ghost; ++i) {
+        for (int j = ghost; j < jmax + ghost; ++j) {
+            const Primitive& Vcell = V[i][j];
+            double a = std::sqrt(gamma * Vcell.P / Vcell.rho);
+            double u = Vcell.u;
+            double v = Vcell.v;
+
+            // Eigenvalues across each face
+            double lambda_iL = std::abs(u * nx_face_i[i][j] + v * ny_face_i[i][j]) + a;
+            double lambda_iR = std::abs(u * nx_face_i[i+1][j] + v * ny_face_i[i+1][j]) + a;
+
+            double lambda_jB = std::abs(u * nx_face_j[i][j] + v * ny_face_j[i][j]) + a;
+            double lambda_jT = std::abs(u * nx_face_j[i][j+1] + v * ny_face_j[i][j+1]) + a;
+
+            double areaSum =
+                lambda_iL * A_face_i[i][j] +
+                lambda_iR * A_face_i[i+1][j] +
+                lambda_jB * A_face_j[i][j] +
+                lambda_jT * A_face_j[i][j+1];
+
+            double dt_cell = CFL * cellVolume[i][j] / areaSum;
+
+            if (dt_cell < dtMin) dtMin = dt_cell;
+        }
+    }
+
+    return dtMin;
+}
+
+// Compute area of cell (i,j) using diagonals AC and BD
+double computeCellArea(
+    int i, int j,
+    const std::vector<std::vector<double>>& x_cell,
+    const std::vector<std::vector<double>>& y_cell
+) {
+    // Corners (centered at 4 points)
+    double xa = x_cell[i  ][j  ];
+    double ya = y_cell[i  ][j  ];
+    double xb = x_cell[i+1][j  ];
+    double yb = y_cell[i+1][j  ];
+    double xc = x_cell[i+1][j+1];
+    double yc = y_cell[i+1][j+1];
+    double xd = x_cell[i  ][j+1];
+    double yd = y_cell[i  ][j+1];
+
+    // Diagonals
+    double ac_x = xc - xa;
+    double ac_y = yc - ya;
+    double bd_x = xb - xd;
+    double bd_y = yb - yd;
+
+    // Cross product magnitude
+    double area = 0.5 * std::abs(ac_x * bd_y - ac_y * bd_x);
+    return area;
+}
+
 
 // ---------------------------------------------------------------------
 // ComputeFaceFlux:
@@ -1103,45 +1303,35 @@ int main() {
       std::cout << "[INFO] Using debug Cartesian mesh: imax="<<imax<<", jmax="<<jmax<<"\n";
     }
 
+    // Define the volume array (global or local)
+    std::vector<std::vector<double>> cellVolume(imax + 2 * ghost, std::vector<double>(jmax + 2 * ghost, 0.0));
 
-      // 4) Call initializeMMS to fill U/V with the exact primitive → conserved MMS solution:
-      int    mmsCase  = 1;          // 1 = supersonic, 2 = subsonic
+    // Loop over interior cells
+    for (int i = ghost; i < imax + ghost; ++i) {
+        for (int j = ghost; j < jmax + ghost; ++j) {
+            cellVolume[i][j] = computeCellArea(i, j, x_cell, y_cell);
+        }
+    }
 
 
-      initializeMMS( mmsCase, L, x_cell, y_cell, U, V);
+    // 3) Call initializeMMS to fill U/V with the exact primitive → conserved MMS solution:
+    int mmsCase = 1;
+    initializeMMS(mmsCase, L, x_cell, y_cell, U, V);
 
-      // Now U[i][j] and V[i][j] for i=ghost..ghost+imax−1, j=ghost..ghost+jmax−1
+    // Now U[i][j] and V[i][j] for i=ghost..ghost+imax−1, j=ghost..ghost+jmax−1
       // contain the _exact_ MMS solution at each cell‐center.
 
-      // 5) If you want to compute, say, the source–term array S[i][j], do:
-      std::vector<std::vector<Conserved>> S;
-      computeSourceTermsMMS(
-        mmsCase,
-        gamma,
-        L,
-        x_cell,
-        y_cell,
-        S
-      );
 
-      // Now S[i][j] holds –(∂F/∂x + ∂G/∂y) at the exact solution,
-      // for i=ghost..ghost+imax−1, j=ghost..ghost+jmax−1.
+    // Apply the Dirichlet Boundary Conditions
+    applyBoundaryConditions(U, V, mmsCase, L, x_cell, y_cell);
 
-      // 6) Proceed with your solver iterations, using U, V, and S as needed.
-      //    (For a “true” MMS run you would add S into your residual after computing
-      //     numerical fluxes, so that the exact solution makes the discrete residual ≈ 0.)
-
-      std::cout << "[INFO] Finished initializing MMS solution and source terms.\n";
+    double dt = computeTimeStep(V, cellVolume, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j);
+    std::cout << "[INFO] Computed time step: dt = " << dt << std::endl;
 
 
 
-      // 5) Apply **exact** Dirichlet BC on all boundaries
-      applyMMSDirichletBCs(mmsCase, L, x_cell, y_cell);
 
 
-      // 6) Precompute MMS source terms once
-      std::vector<std::vector<Cons>> S(ni-2, std::vector<Cons>(nj-2));
-      ComputeSourceTermsMMS(xcc, ycc, S);
 
       // --- Output the initial solution (iteration 0) ---
       OutputSolution(solFile, 0, true);
