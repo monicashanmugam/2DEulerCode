@@ -40,21 +40,22 @@ struct Primitive {
 // Conserved variables: mass, momentum, energy
 struct Conserved {
     double rho;    // mass
-    double rhou;   // momentum in x‐direction
-    double rhov;   // momentum in y‐direction  
+    double rhou;   // momentum in x-direction
+    double rhov;   // momentum in y-direction  
     double E;      // total energy
 };
+
 
 
 //-----------------------------------------------------
 // Global Arrays for the CFD Solver
 //-----------------------------------------------------
 
-// Define the globals declared in variables.hpp
 int imax;
 int jmax;
-std::vector<std::vector<Conserved>> U;
-std::vector<std::vector<Primitive>> V;
+std::vector<std::vector<Conserved>> U(imax, std::vector<Conserved>(jmax));  // 2D vector for conserved variables
+std::vector<std::vector<Primitive>> V(imax, std::vector<Primitive>(jmax));  // 2D vector for primitive variables
+
 
 // Inline operator overloads for “Conserved”
 inline Conserved operator+(const Conserved &a, const Conserved &b) {
@@ -211,7 +212,8 @@ inline void readCurviMeshFromFile(
     std::vector<std::vector<double>> & nx_face_i,
     std::vector<std::vector<double>> & ny_face_i,
     std::vector<std::vector<double>> & nx_face_j,
-    std::vector<std::vector<double>> & ny_face_j
+    std::vector<std::vector<double>> & ny_face_j,
+    double &xmin, double &xmax, double &ymin, double &ymax, double &dx, double &dy
 ) {
     // 1) Open the file
     std::ifstream in(filepath);
@@ -225,101 +227,108 @@ inline void readCurviMeshFromFile(
     in >> nzones >> imax >> jmax >> kmax;
     assert(nzones == 1 && kmax == 2);
 
+    // Resize the arrays here after reading imax and jmax
+    U.resize(imax + 2 * ghost, std::vector<Conserved>(jmax + 2 * ghost));
+    V.resize(imax + 2 * ghost, std::vector<Primitive>(jmax + 2 * ghost));
+
     // 3) Compute total array dimensions (including two ghost layers on each side)
-    int Ni = imax + 2*ghost;
-    int Nj = jmax + 2*ghost;
+    int Ni = imax + 2 * ghost;
+    int Nj = jmax + 2 * ghost;
 
     // 4) Resize all eight arrays to the correct sizes
-    x_cell   .assign(Ni, std::vector<double>(Nj, 0.0));
-    y_cell   .assign(Ni, std::vector<double>(Nj, 0.0));
-    A_face_i .assign(Ni+1, std::vector<double>(Nj, 0.0));
-    A_face_j .assign(Ni,   std::vector<double>(Nj+1, 0.0));
-    nx_face_i.assign(Ni+1, std::vector<double>(Nj, 0.0));
-    ny_face_i.assign(Ni+1, std::vector<double>(Nj, 0.0));
-    nx_face_j.assign(Ni,   std::vector<double>(Nj+1, 0.0));
-    ny_face_j.assign(Ni,   std::vector<double>(Nj+1, 0.0));
+    x_cell.assign(Ni, std::vector<double>(Nj, 0.0));
+    y_cell.assign(Ni, std::vector<double>(Nj, 0.0));
+    A_face_i.assign(Ni + 1, std::vector<double>(Nj, 0.0));
+    A_face_j.assign(Ni, std::vector<double>(Nj + 1, 0.0));
+    nx_face_i.assign(Ni + 1, std::vector<double>(Nj, 0.0));
+    ny_face_i.assign(Ni + 1, std::vector<double>(Nj, 0.0));
+    nx_face_j.assign(Ni, std::vector<double>(Nj + 1, 0.0));
+    ny_face_j.assign(Ni, std::vector<double>(Nj + 1, 0.0));
 
     // 5) Read interior cell-centers in the same order as the Fortran code:
-    //      for k = 1..kmax
-    //        for j = 1..jmax
-    //          for i = 1..imax
-    //            read x(i,j) -> store into x_cell[i-1+ghost][j-1+ghost]
-    //    then repeat for y(i,j).
     for (int k = 1; k <= kmax; ++k) {
         for (int j = 1; j <= jmax; ++j) {
             for (int i = 1; i <= imax; ++i) {
-                double xx;
-                in >> xx;
+                double xx, yy;
+                in >> xx >> yy;
                 x_cell[i - 1 + ghost][j - 1 + ghost] = xx;
-            }
-        }
-    }
-    for (int k = 1; k <= kmax; ++k) {
-        for (int j = 1; j <= jmax; ++j) {
-            for (int i = 1; i <= imax; ++i) {
-                double yy;
-                in >> yy;
                 y_cell[i - 1 + ghost][j - 1 + ghost] = yy;
             }
         }
     }
 
-    // 6) Mirror-extrapolate two ghost layers in the i-direction (left/right)
+    // 6) Mirror-extrapolate two ghost layers (i-direction and j-direction)
     for (int i = 0; i < ghost; ++i) {
         int iL = ghost - 1 - i;
         int iR = ghost + imax + i;
         for (int j = ghost; j < ghost + jmax; ++j) {
-            x_cell[iL][j] = x_cell[2*ghost - 1 - i][j];
-            y_cell[iL][j] = y_cell[2*ghost - 1 - i][j];
+            x_cell[iL][j] = x_cell[2 * ghost - 1 - i][j];
+            y_cell[iL][j] = y_cell[2 * ghost - 1 - i][j];
             x_cell[iR][j] = x_cell[ghost + imax - 1 - i][j];
             y_cell[iR][j] = y_cell[ghost + imax - 1 - i][j];
         }
     }
 
-    // 7) Mirror-extrapolate two ghost layers in the j-direction (bottom/top)
     for (int j = 0; j < ghost; ++j) {
         int jB = ghost - 1 - j;
         int jT = ghost + jmax + j;
         for (int i = 0; i < Ni; ++i) {
-            x_cell[i][jB] = x_cell[i][2*ghost - 1 - j];
-            y_cell[i][jB] = y_cell[i][2*ghost - 1 - j];
+            x_cell[i][jB] = x_cell[i][2 * ghost - 1 - j];
+            y_cell[i][jB] = y_cell[i][2 * ghost - 1 - j];
             x_cell[i][jT] = x_cell[i][ghost + jmax - 1 - j];
             y_cell[i][jT] = y_cell[i][ghost + jmax - 1 - j];
         }
     }
 
-    // 8) Compute vertical (i-) face lengths and outward normals
+    // 7) Compute vertical (i-) face lengths and outward normals
     for (int i = 0; i <= Ni; ++i) {
         for (int j = ghost; j < ghost + jmax; ++j) {
-            int iL = std::max(0,   i - 1);
-            int iR = std::min(Ni-1, i);
+            int iL = std::max(0, i - 1);
+            int iR = std::min(Ni - 1, i);
             double dx = x_cell[iR][j] - x_cell[iL][j];
             double dy = y_cell[iR][j] - y_cell[iL][j];
-            double len = std::sqrt(dx*dx + dy*dy);
+            double len = std::sqrt(dx * dx + dy * dy);
 
-            A_face_i[i][j]   = len;
-            // Outward normal: pointing from right-cell toward left-cell
-            nx_face_i[i][j] =  dy / len;
+            A_face_i[i][j] = len;
+            nx_face_i[i][j] = dy / len;
             ny_face_i[i][j] = -dx / len;
         }
     }
 
-    // 9) Compute horizontal (j-) face lengths and outward normals
+    // 8) Compute horizontal (j-) face lengths and outward normals
     for (int j = 0; j <= Nj; ++j) {
         for (int i = ghost; i < ghost + imax; ++i) {
-            int jB = std::max(0,   j - 1);
-            int jT = std::min(Nj-1, j);
+            int jB = std::max(0, j - 1);
+            int jT = std::min(Nj - 1, j);
             double dx = x_cell[i][jT] - x_cell[i][jB];
             double dy = y_cell[i][jT] - y_cell[i][jB];
-            double len = std::sqrt(dx*dx + dy*dy);
+            double len = std::sqrt(dx * dx + dy * dy);
 
-            A_face_j[i][j]   = len;
-            // Outward normal: pointing from top-cell toward bottom-cell
+            A_face_j[i][j] = len;
             nx_face_j[i][j] = -dy / len;
-            ny_face_j[i][j] =  dx / len;
+            ny_face_j[i][j] = dx / len;
         }
     }
+
+    // 9) Compute the domain boundaries and grid spacings dx and dy
+    xmin = x_cell[ghost][ghost];  // Minimum x-value
+    xmax = x_cell[imax + ghost - 1][jmax + ghost - 1];  // Maximum x-value
+    ymin = y_cell[ghost][ghost];  // Minimum y-value
+    ymax = y_cell[imax + ghost - 1][jmax + ghost - 1];  // Maximum y-value
+
+    // Calculate grid spacings dx and dy
+    dx = (xmax - xmin) / imax;
+    dy = (ymax - ymin) / jmax;
+
+    // Output the domain boundaries and grid spacing
+    std::cout << "[INFO] Domain boundaries:\n";
+    std::cout << "xmin = " << xmin << ", xmax = " << xmax << "\n";
+    std::cout << "ymin = " << ymin << ", ymax = " << ymax << "\n";
+
+    std::cout << "[INFO] Grid spacings:\n";
+    std::cout << "dx = " << dx << ", dy = " << dy << std::endl;
 }
+
 
 // 2) Overwrite everything (cell-centers, face lengths, normals) with a uniform
 //    Cartesian grid of size imax x jmax over [0,L]x[0,L].  This is debug mode.
@@ -327,49 +336,57 @@ inline void readCurviMeshFromFile(
 //    curvilinear grid-because the same eight arrays are filled, but in a trivial
 //    Cartesian way.
 
-inline void convertToCartesianDebug(
-    double L,
-    std::vector<std::vector<double>> & x_cell,
-    std::vector<std::vector<double>> & y_cell,
-    std::vector<std::vector<double>> & A_face_i,
-    std::vector<std::vector<double>> & A_face_j,
-    std::vector<std::vector<double>> & nx_face_i,
-    std::vector<std::vector<double>> & ny_face_i,
-    std::vector<std::vector<double>> & nx_face_j,
-    std::vector<std::vector<double>> & ny_face_j
+inline std::tuple<double, double, double, double, double, double> convertToCartesianDebug(
+    double L,  // Domain length
+    std::vector<std::vector<double>>& x_cell,
+    std::vector<std::vector<double>>& y_cell,
+    std::vector<std::vector<double>>& A_face_i,
+    std::vector<std::vector<double>>& A_face_j,
+    std::vector<std::vector<double>>& nx_face_i,
+    std::vector<std::vector<double>>& ny_face_i,
+    std::vector<std::vector<double>>& nx_face_j,
+    std::vector<std::vector<double>>& ny_face_j
 ) {
-    // We assume imax, jmax, and ghost are global constants or globals
-    int Ni = imax + 2*ghost;
-    int Nj = jmax + 2*ghost;
+    // Total grid size including ghost layers
+    int Ni = imax + 2 * ghost;
+    int Nj = jmax + 2 * ghost;
 
-    // Uniform spacing
-    double dx = L / double(imax);
-    double dy = L / double(jmax);
+    // Uniform grid spacing
+    double dx = L / double(imax);  // Grid spacing in the x-direction
+    double dy = L / double(jmax);  // Grid spacing in the y-direction
 
-    // 1) Assign cell-center coordinates uniformly on [0,L]x[0,L]
+    // Assign cell-center coordinates uniformly on [0, L] x [0, L]
     x_cell.assign(Ni, std::vector<double>(Nj, 0.0));
     y_cell.assign(Ni, std::vector<double>(Nj, 0.0));
+
+    // Calculate cell-center positions
     for (int i = 0; i < Ni; ++i) {
         for (int j = 0; j < Nj; ++j) {
-            x_cell[i][j] = (i - ghost + 0.5) * dx;
-            y_cell[i][j] = (j - ghost + 0.5) * dy;
+            x_cell[i][j] = (i - ghost) * dx;  // X-coordinate of the cell center
+            y_cell[i][j] = (j - ghost) * dy;  // Y-coordinate of the cell center
         }
     }
 
-    // 2) Every vertical face (i-face) has the same length = dy,
-    //    and outward normal = ( +1, 0 ).  We choose +1 so that
-    //    face-i index i points into the cell at (i-1).
-    A_face_i.assign(Ni+1, std::vector<double>(Nj, dy));
-    nx_face_i.assign(Ni+1, std::vector<double>(Nj, +1.0));
-    ny_face_i.assign(Ni+1, std::vector<double>(Nj,  0.0));
+    // Set the face lengths (constant for Cartesian grid)
+    A_face_i.assign(Ni + 1, std::vector<double>(Nj, dy));
+    nx_face_i.assign(Ni + 1, std::vector<double>(Nj, 1.0));  // Normal is (1,0)
+    ny_face_i.assign(Ni + 1, std::vector<double>(Nj, 0.0));
 
-    // 3) Every horizontal face (j-face) has the same length = dx,
-    //    and outward normal = ( 0, +1 ).  We choose +1 so that
-    //    face-j index j points into the cell at (j-1).
-    A_face_j.assign(Ni,   std::vector<double>(Nj+1, dx));
-    nx_face_j.assign(Ni,   std::vector<double>(Nj+1,  0.0));
-    ny_face_j.assign(Ni,   std::vector<double>(Nj+1, +1.0));
+    A_face_j.assign(Ni, std::vector<double>(Nj + 1, dx));
+    nx_face_j.assign(Ni, std::vector<double>(Nj + 1, 0.0));  // Normal is (0,1)
+    ny_face_j.assign(Ni, std::vector<double>(Nj + 1, 1.0));
+
+    // Compute the domain boundaries
+    double xmin = x_cell[ghost][ghost];  // Minimum x-value
+    double xmax = x_cell[imax + ghost - 1][jmax + ghost - 1];  // Maximum x-value
+    double ymin = y_cell[ghost][ghost];  // Minimum y-value
+    double ymax = y_cell[imax + ghost - 1][jmax + ghost - 1];  // Maximum y-value
+
+    // Return all the computed values
+    return {xmin, xmax, ymin, ymax, dx, dy};
 }
+
+
 
 //----------------------------------------------------------------------
 // (A) Define supersonic and subsonic MMS constants
@@ -870,9 +887,11 @@ void applyBoundaryConditions(
         for (int j = 0; j < nj; ++j) {
             if (i >= ghost && i < ghost + imax && j >= ghost && j < ghost + jmax) continue;
 
+            // Calculate boundary x and y positions
             double x = x_cell[i][j];
             double y = y_cell[i][j];
 
+            // Initialize the Primitive and Conserved variables
             Primitive Vcell;
             Vcell.rho = rho_mms(mmsCase, L, x, y);
             Vcell.u   = uvel_mms(mmsCase, L, x, y);
@@ -881,11 +900,13 @@ void applyBoundaryConditions(
 
             Conserved Ucell = PrimitiveToConserved(Vcell);
 
+            // Update boundary cells (ghost cells)
             V[i][j] = Vcell;
             U[i][j] = Ucell;
         }
     }
 }
+
 
 double computeTimeStep(
     const std::vector<std::vector<Primitive>>& V,
@@ -1156,19 +1177,123 @@ void computeResidualMMS(
     }
 }
 
-
-// Define a structure to hold the three residual norms and a combined value.
+// Define the ResidualTriple structure
 struct ResidualTriple {
-    double mass;
-    double mom;
-    double eng;
-    double combined;  // For example, the maximum of the three.
+    double mass;      // Mass residual
+    double mom;       // Momentum residual (combined for x and y directions)
+    double eng;       // Energy residual
+    double combined;  // Combined residual (max of all three norms)
 };
+
+ResidualTriple UpdateSolution2D(double dt, int fluxOrder, double kappa, bool freezeLimiter, 
+                                 std::vector<std::vector<Conserved>>& R_int, 
+                                 double xmin, double xmax, double ymin, double ymax, 
+                                 bool debugMode, double dx, double dy) {
+    // Compute the residuals for the MMS case
+    computeResidualMMS(fluxOrder, kappa, freezeLimiter, x_cell, y_cell, V, R_int);
+
+    // Setup: the solution array `U_new` is where we'll store the updated values
+    std::vector<std::vector<Conserved>> U_new = U; // Copying the 2D vector
+
+    // Loop over all interior cells to update solution based on the residuals
+    for (int i = ghost; i < imax + ghost; ++i) {
+        for (int j = ghost; j < jmax + ghost; ++j) {
+            double cellVolume = 0.0;
+
+            // For Cartesian grids, use uniform spacing for cell volume
+            if (debugMode) {
+                cellVolume = dx * dy;  // In Cartesian grid, cell volume is just area * dx * dy
+            } 
+            // For curvilinear grids, calculate the face area and volume based on geometry
+            else {
+                // Compute face areas (vertical and horizontal faces)
+                double verticalFaceLength_i = sqrt(pow(x_cell[i + 1][j + 1] - x_cell[i + 1][j], 2) + 
+                                                   pow(y_cell[i + 1][j + 1] - y_cell[i + 1][j], 2));
+                double horizontalFaceLength_j = sqrt(pow(x_cell[i][j + 1] - x_cell[i][j], 2) + 
+                                                     pow(y_cell[i][j + 1] - y_cell[i][j], 2));
+
+                // Calculate the cell volume using the face areas in both directions
+                cellVolume = verticalFaceLength_i * horizontalFaceLength_j;
+            }
+
+            // Update solution based on residuals (accessing elements of U_new correctly)
+            U_new[i][j].rho  = U[i][j].rho  - (dt / cellVolume) * R_int[i][j].rho;
+            U_new[i][j].rhou = U[i][j].rhou - (dt / cellVolume) * R_int[i][j].rhou;
+            U_new[i][j].rhov = U[i][j].rhov - (dt / cellVolume) * R_int[i][j].rhov;
+            U_new[i][j].E    = U[i][j].E    - (dt / cellVolume) * R_int[i][j].E;
+        }
+    }
+
+    // Now update the solution (excluding ghost cells)
+    for (int i = ghost; i < imax + ghost; ++i) {
+        for (int j = ghost; j < jmax + ghost; ++j) {
+            U[i][j] = U_new[i][j];
+        }
+    }
+
+    // Optional: Convert conserved variables to primitive variables (e.g., density, velocity, pressure)
+    GlobalConservedToPrimitive();
+
+    // -------------------------------
+    // Compute residual norms (optional but useful for monitoring convergence)
+    double sumMass = 0.0, sumMomX = 0.0, sumMomY = 0.0, sumEng = 0.0;
+    for (int i = ghost; i < imax + ghost; ++i) { // Loop should exclude ghost cells
+        for (int j = ghost; j < jmax + ghost; ++j) {
+            sumMass += R_int[i][j].rho * R_int[i][j].rho;
+            sumMomX += R_int[i][j].rhou * R_int[i][j].rhou;  // momentum in x-direction
+            sumMomY += R_int[i][j].rhov * R_int[i][j].rhov;  // momentum in y-direction
+            sumEng  += R_int[i][j].E * R_int[i][j].E;
+        }
+    }
+
+    double currentMass = sqrt(sumMass / (imax * jmax));
+    double currentMomX = sqrt(sumMomX / (imax * jmax));
+    double currentMomY = sqrt(sumMomY / (imax * jmax));
+    double currentEng  = sqrt(sumEng / (imax * jmax));
+
+    // Normalize the residuals, based on the initial values
+    static bool normBaseSet = false;
+    static double initMass = 0.0, initMomX = 0.0, initMomY = 0.0, initEng = 0.0;
+    if (!normBaseSet) {
+        initMass = currentMass;
+        initMomX = currentMomX;
+        initMomY = currentMomY;
+        initEng  = currentEng;
+        normBaseSet = true;
+    }
+
+    double resMass_norm = (fabs(initMass) < 1e-12 ? currentMass : currentMass / initMass);
+    double resMomX_norm = (fabs(initMomX) < 1e-12 ? currentMomX : currentMomX / initMomX);  // normalize x-direction momentum
+    double resMomY_norm = (fabs(initMomY) < 1e-12 ? currentMomY : currentMomY / initMomY);  // normalize y-direction momentum
+    double resEng_norm  = (fabs(initEng)  < 1e-12 ? currentEng  : currentEng / initEng);
+
+    cout << "Residual Norms (Normalized): Mass = " << resMass_norm
+         << ", Momentum (x-direction) = " << resMomX_norm
+         << ", Momentum (y-direction) = " << resMomY_norm
+         << ", Energy = " << resEng_norm << endl;
+
+    double combinedResidual = std::max({resMass_norm, resMomX_norm, resMomY_norm, resEng_norm});
+    cout << "[INFO] Combined residual: " << combinedResidual << endl;
+
+    ResidualTriple residualData;
+    residualData.mass = resMass_norm;
+    residualData.mom = std::max(resMomX_norm, resMomY_norm);  // Combined momentum norm
+    residualData.eng = resEng_norm;
+    residualData.combined = combinedResidual;
+
+    return residualData;
+}
+
+
+
 
 
 
 int main() {
 
+  int fluxOrder = 2;  // Second-order MUSCL
+  double kappa = 0.5; // Choose limiter parameter (e.g., -1, 0, 0.5, or 1)
+  bool freezeLimiter = false;  // Set to true for pure MUSCL (no limiter)
 
     // Create an output folder if needed.
     string outFolder = "OutputFiles";
@@ -1188,11 +1313,12 @@ int main() {
     const std::string meshFile = R"(C:\Users\monicashanmugam\OneDrive - Virginia Tech\Desktop\Virginia Tech\CFD\Project\Project_Files\Project_Files\Grids\curviliniear-grids\curv2d9.grd)";
 
     // 2) Decide whether you want to run in DEBUG (Cartesian) mode
-    bool debugMode = true;  // set true if you want a simple Cartesian mesh   
+    bool debugMode = true;  // set true if you want a simple Cartesian mesh  
+    
+    double xmin, xmax, ymin, ymax, dx, dy;
     
     if (!debugMode) {
-      // read full curvilinear geometry from file:
-      readCurviMeshFromFile(meshFile, x_cell, y_cell, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j);
+      readCurviMeshFromFile(meshFile, x_cell, y_cell, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j, xmin, xmax, ymin, ymax, dx, dy);
       std::cout << "[INFO] Loaded curvi mesh with imax = " << imax << ", jmax = " << jmax << "\n";
     }
     else {
@@ -1204,7 +1330,7 @@ int main() {
         assert(nz == 1 && kmax == 2);
       }
     
-      convertToCartesianDebug( L, x_cell, y_cell, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j );
+      std::tie(xmin, xmax, ymin, ymax, dx, dy) = convertToCartesianDebug(L, x_cell, y_cell, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j);
       std::cout << "[INFO] Using debug Cartesian mesh: imax="<<imax<<", jmax="<<jmax<<"\n";
     }
 
@@ -1244,9 +1370,6 @@ int main() {
         std::cout << "nx_face_j[" << i << "] = " << nx_face_j[i][0] << ", ny_face_j[" << i << "] = " << ny_face_j[i][0] << "\n";
     }
 
-
-
-
     // 3) Call initializeMMS to fill U/V with the exact primitive → conserved MMS solution:
     int mmsCase = 1;
     initializeMMS(mmsCase, L, x_cell, y_cell, U, V);
@@ -1263,6 +1386,9 @@ int main() {
     double dt = computeTimeStep(V, cellVolume, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j);
     std::cout << "[INFO] Computed time step: dt = " << dt << "\n";
 
+    std::vector<std::vector<Conserved>> R_int(imax, std::vector<Conserved>(jmax));  // Residuals
+    // Call UpdateSolution2D
+    ResidualTriple residuals = UpdateSolution2D(dt, fluxOrder, kappa, freezeLimiter, R_int, xmin, xmax, ymin, ymax, debugMode, dx, dy);
 
       return 0;
     }
