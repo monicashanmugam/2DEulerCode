@@ -6,7 +6,7 @@
 #include <algorithm>
 #include <cassert>
 #include <filesystem>  
-
+#include <tuple>
 
 
 using namespace std;
@@ -227,13 +227,14 @@ inline void readCurviMeshFromFile(
     in >> nzones >> imax >> jmax >> kmax;
     assert(nzones == 1 && kmax == 2);
 
-    // Resize the arrays here after reading imax and jmax
-    U.resize(imax + 2 * ghost, std::vector<Conserved>(jmax + 2 * ghost));
-    V.resize(imax + 2 * ghost, std::vector<Primitive>(jmax + 2 * ghost));
-
     // 3) Compute total array dimensions (including two ghost layers on each side)
     int Ni = imax + 2 * ghost;
     int Nj = jmax + 2 * ghost;
+
+    for(int i=0;i<Ni;++i){
+    U[i].resize(Nj);
+    V[i].resize(Nj);
+  }
 
     // 4) Resize all eight arrays to the correct sizes
     x_cell.assign(Ni, std::vector<double>(Nj, 0.0));
@@ -350,6 +351,7 @@ inline std::tuple<double, double, double, double, double, double> convertToCarte
     // Total grid size including ghost layers
     int Ni = imax + 2 * ghost;
     int Nj = jmax + 2 * ghost;
+
 
     // Uniform grid spacing
     double dx = L / double(imax);  // Grid spacing in the x-direction
@@ -1125,57 +1127,37 @@ void computeResidualMMS(
     const std::vector<std::vector<double>>& y_cell,
     const std::vector<std::vector<Primitive>>& V,
     std::vector<std::vector<Conserved>>& R
-) {
-    int Ni = imax + 2*ghost;
-    int Nj = jmax + 2*ghost;
+) {  
+  int Ni = imax + 2*ghost;
+  int Nj = jmax + 2*ghost;
 
-    // zero out the residual
-    R.assign(Ni, std::vector<Conserved>(Nj, Conserved{0,0,0,0}));
+  R.assign(Ni, vector<Conserved>(Nj, {0,0,0,0}));
 
-    // ——— i‐faces (vertical faces) ———
-    // faces at i = ghost … ghost+imax (there are imax+1 physical i‐faces)
-    for (int i = ghost; i <= ghost+imax; ++i) {
-      for (int j = ghost; j < ghost+jmax; ++j) {
-        // reconstruct left/right primitives at face (i−½,j)
-        Primitive PL, PR;
-        musclI(V, i, j,
-               fluxOrder, kappa, freezeLimiter,
-               PL, PR);
-
-        // compute split flux through that face
-        auto F = faceFluxVL2D(PL, PR,
-                              nx_face_i[i][j],
-                              ny_face_i[i][j],
-                              A_face_i[i][j]);
-
-        // subtract from left cell, add to right cell
-        R[i-1][j] -= F;
-        R[i  ][j] += F;
-      }
+  // —— vertical (i‐faces) ——
+// only go as far as i+2 < Ni  ⇒  i ≤ Ni-3  ⇒  i ≤ (ghost+imax-1)
+  for(int i = ghost; i <= ghost+imax-1; ++i){
+    for(int j = ghost; j < ghost+jmax; ++j){
+      Primitive PL, PR;
+      musclI(V, i, j, fluxOrder, kappa, freezeLimiter, PL, PR);
+      auto F = faceFluxVL2D(PL, PR, nx_face_i[i][j], ny_face_i[i][j], A_face_i[i][j]);
+      R[i-1][j] -= F;
+      R[i  ][j] += F;
     }
+  }
 
-    // ——— j‐faces (horizontal faces) ———
-    // faces at j = ghost … ghost+jmax (there are jmax+1 physical j‐faces)
-    for (int i = ghost; i < ghost+imax; ++i) {
-      for (int j = ghost; j <= ghost+jmax; ++j) {
-        // reconstruct left/right primitives at face (i,j−½)
-        Primitive PL, PR;
-        musclJ(V, i, j,
-               fluxOrder, kappa, freezeLimiter,
-               PL, PR);
-
-        // compute split flux through that face
-        auto G = faceFluxVL2D(PL, PR,
-                              nx_face_j[i][j],
-                              ny_face_j[i][j],
-                              A_face_j[i][j]);
-
-        // subtract from bottom cell, add to top cell
-        R[i][j-1] -= G;
-        R[i][j  ] += G;
-      }
+  // —— horizontal (j‐faces) ——
+// only go as far as j+2 < Nj  ⇒  j ≤ Nj-3  ⇒  j ≤ (ghost+jmax-1)
+  for(int i = ghost; i < ghost+imax; ++i){
+    for(int j = ghost; j <= ghost+jmax-1; ++j){
+      Primitive PL, PR;
+      musclJ(V, i, j, fluxOrder, kappa, freezeLimiter, PL, PR);
+      auto G = faceFluxVL2D(PL, PR, nx_face_j[i][j], ny_face_j[i][j], A_face_j[i][j]);
+      R[i][j-1] -= G;
+      R[i][j  ] += G;
     }
+  }
 }
+
 
 // Define the ResidualTriple structure
 struct ResidualTriple {
@@ -1332,7 +1314,23 @@ int main() {
     
       std::tie(xmin, xmax, ymin, ymax, dx, dy) = convertToCartesianDebug(L, x_cell, y_cell, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j);
       std::cout << "[INFO] Using debug Cartesian mesh: imax="<<imax<<", jmax="<<jmax<<"\n";
+      
     }
+
+    // ---------------------------------------------------
+    // NOW: both branches have set imax/jmax and built the geometry
+    int Ni = imax + 2*ghost;
+    int Nj = jmax + 2*ghost;
+
+    // resize solution arrays so U[i][j] and V[i][j] are valid everywhere
+    U.assign(Ni, std::vector<Conserved>(Nj));
+    V.assign(Ni, std::vector<Primitive>(Nj));
+
+    std::cerr << "[DEBUG] After mesh:  U is " 
+              << U.size() << "×" << U[0].size()
+              << ", V is " 
+              << V.size() << "×" << V[0].size()
+              << "\n";
 
     std::cout << "[INFO] Loaded curvi mesh with imax = " << imax << ", jmax = " << jmax << "\n";
     std::cout << "[INFO] Sample values from x_cell and y_cell:\n";
@@ -1357,6 +1355,8 @@ int main() {
             std::cout << "cellVolume[" << i << "][" << j << "] = " << cellVolume[i][j] << "\n";
         }
     }
+
+    
 
 
     std::cout << "[INFO] Sample values from A_face_i and A_face_j:\n";
