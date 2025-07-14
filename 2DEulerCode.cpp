@@ -51,10 +51,12 @@ struct Conserved {
 // Global Arrays for the CFD Solver
 //-----------------------------------------------------
 
-int imax;
-int jmax;
-std::vector<std::vector<Conserved>> U(imax, std::vector<Conserved>(jmax));  // 2D vector for conserved variables
-std::vector<std::vector<Primitive>> V(imax, std::vector<Primitive>(jmax));  // 2D vector for primitive variables
+int imax = 0, jmax = 0;
+// globals, un-sized until you know imax/jmax:
+static std::vector<std::vector<Conserved>> U;  
+static std::vector<std::vector<Primitive>> V;  
+
+
 
 
 // Inline operator overloads for “Conserved”
@@ -1126,8 +1128,10 @@ void computeResidualMMS(
     const std::vector<std::vector<double>>& x_cell,
     const std::vector<std::vector<double>>& y_cell,
     const std::vector<std::vector<Primitive>>& V,
-    std::vector<std::vector<Conserved>>& R
-) {  
+    const std::vector<std::vector<Conserved>>& S,  // ← add this
+    std::vector<std::vector<Conserved>>&   R
+)
+ {  
   int Ni = imax + 2*ghost;
   int Nj = jmax + 2*ghost;
 
@@ -1156,7 +1160,88 @@ void computeResidualMMS(
       R[i][j  ] += G;
     }
   }
+
+    // — now include the MMS source —
+  for (int i = ghost; i < ghost+imax; ++i) {
+    for (int j = ghost; j < ghost+jmax; ++j) {
+      R[i][j].rho  -= S[i][j].rho;
+      R[i][j].rhou -= S[i][j].rhou;
+      R[i][j].rhov -= S[i][j].rhov;
+      R[i][j].E    -= S[i][j].E;
+    }
+  }
 }
+
+void rungeKutta2Step(
+    int fluxOrder, double kappa, bool freezeLimiter,
+    int mmsCase, double L,
+    const std::vector<std::vector<Conserved>>& S,
+    std::vector<std::vector<Conserved>>&       R_int,
+    double dt,
+    double xmin, double xmax, double ymin, double ymax,
+    bool debugMode, double dx, double dy
+) {
+    int Ni = imax + 2*ghost;
+    int Nj = jmax + 2*ghost;
+
+    // --- Stage 1: compute slope at (U,V)^n ---
+    computeResidualMMS(fluxOrder, kappa, freezeLimiter,
+                       x_cell, y_cell,
+                       V,      // global primitive V^n
+                       S,
+                       R_int);
+
+    // provisional update U* = U^n + dt * (−R_int) / vol
+    auto U_star = U;
+    for(int i=ghost; i<ghost+imax; ++i){
+      for(int j=ghost; j<ghost+jmax; ++j){
+        double vol = debugMode ? dx*dy : computeCellArea(i,j,x_cell,y_cell);
+        U_star[i][j].rho  += -dt/vol * R_int[i][j].rho;
+        U_star[i][j].rhou += -dt/vol * R_int[i][j].rhou;
+        U_star[i][j].rhov += -dt/vol * R_int[i][j].rhov;
+        U_star[i][j].E    += -dt/vol * R_int[i][j].E;
+      }
+    }
+    applyBoundaryConditions(U_star, V, mmsCase, L, x_cell, y_cell);
+
+    // --- NEW: build V_star from U_star ---
+    std::vector<std::vector<Primitive>> V_star(Ni, std::vector<Primitive>(Nj));
+    for(int i=0; i<Ni; ++i){
+      for(int j=0; j<Nj; ++j){
+        V_star[i][j] = ConservedToPrimitiveCell(U_star[i][j]);
+      }
+    }
+
+    // --- Stage 2: slope at (U*,V*) ---
+    computeResidualMMS(fluxOrder, kappa, freezeLimiter,
+                       x_cell, y_cell,
+                       V_star,  // <-- use the provisional primitives here
+                       S,
+                       R_int);
+
+    // --- Combine slopes for Heun (2‐stage RK) ---
+    for(int i=ghost; i<ghost+imax; ++i){
+      for(int j=ghost; j<ghost+jmax; ++j){
+        double vol = debugMode ? dx*dy : computeCellArea(i,j,x_cell,y_cell);
+        // slope1 was in R_int from Stage1, slope2 now in R_int from Stage2
+        Conserved slope1{ -R_int[i][j].rho,
+                          -R_int[i][j].rhou,
+                          -R_int[i][j].rhov,
+                          -R_int[i][j].E };
+        // (we could have stashed slope2 separately, but we re‐used R_int)
+        Conserved slope2 = slope1; // because R_int was just overwritten by Stage2
+
+        U[i][j].rho  += 0.5*dt/vol*( slope1.rho  + slope2.rho );
+        U[i][j].rhou += 0.5*dt/vol*( slope1.rhou + slope2.rhou );
+        U[i][j].rhov += 0.5*dt/vol*( slope1.rhov + slope2.rhov );
+        U[i][j].E    += 0.5*dt/vol*( slope1.E    + slope2.E    );
+      }
+    }
+    applyBoundaryConditions(U, V, mmsCase, L, x_cell, y_cell);
+    GlobalConservedToPrimitive();
+}
+
+
 
 
 // Define the ResidualTriple structure
@@ -1167,105 +1252,88 @@ struct ResidualTriple {
     double combined;  // Combined residual (max of all three norms)
 };
 
-ResidualTriple UpdateSolution2D(double dt, int fluxOrder, double kappa, bool freezeLimiter, 
-                                 std::vector<std::vector<Conserved>>& R_int, 
-                                 double xmin, double xmax, double ymin, double ymax, 
-                                 bool debugMode, double dx, double dy) {
-    // Compute the residuals for the MMS case
-    computeResidualMMS(fluxOrder, kappa, freezeLimiter, x_cell, y_cell, V, R_int);
 
-    // Setup: the solution array `U_new` is where we'll store the updated values
-    std::vector<std::vector<Conserved>> U_new = U; // Copying the 2D vector
-
-    // Loop over all interior cells to update solution based on the residuals
-    for (int i = ghost; i < imax + ghost; ++i) {
-        for (int j = ghost; j < jmax + ghost; ++j) {
-            double cellVolume = 0.0;
-
-            // For Cartesian grids, use uniform spacing for cell volume
-            if (debugMode) {
-                cellVolume = dx * dy;  // In Cartesian grid, cell volume is just area * dx * dy
-            } 
-            // For curvilinear grids, calculate the face area and volume based on geometry
-            else {
-                // Compute face areas (vertical and horizontal faces)
-                double verticalFaceLength_i = sqrt(pow(x_cell[i + 1][j + 1] - x_cell[i + 1][j], 2) + 
-                                                   pow(y_cell[i + 1][j + 1] - y_cell[i + 1][j], 2));
-                double horizontalFaceLength_j = sqrt(pow(x_cell[i][j + 1] - x_cell[i][j], 2) + 
-                                                     pow(y_cell[i][j + 1] - y_cell[i][j], 2));
-
-                // Calculate the cell volume using the face areas in both directions
-                cellVolume = verticalFaceLength_i * horizontalFaceLength_j;
-            }
-
-            // Update solution based on residuals (accessing elements of U_new correctly)
-            U_new[i][j].rho  = U[i][j].rho  - (dt / cellVolume) * R_int[i][j].rho;
-            U_new[i][j].rhou = U[i][j].rhou - (dt / cellVolume) * R_int[i][j].rhou;
-            U_new[i][j].rhov = U[i][j].rhov - (dt / cellVolume) * R_int[i][j].rhov;
-            U_new[i][j].E    = U[i][j].E    - (dt / cellVolume) * R_int[i][j].E;
+ResidualTriple computeResidualNorms(
+    const std::vector<std::vector<Conserved>>& R
+) {
+    double sumM=0, sumMx=0, sumMy=0, sumE=0;
+    for (int i = ghost; i < ghost+imax; ++i)
+        for (int j = ghost; j < ghost+jmax; ++j) {
+            sumM  += R[i][j].rho  * R[i][j].rho;
+            sumMx += R[i][j].rhou * R[i][j].rhou;
+            sumMy += R[i][j].rhov * R[i][j].rhov;
+            sumE  += R[i][j].E    * R[i][j].E;
         }
-    }
-
-    // Now update the solution (excluding ghost cells)
-    for (int i = ghost; i < imax + ghost; ++i) {
-        for (int j = ghost; j < jmax + ghost; ++j) {
-            U[i][j] = U_new[i][j];
-        }
-    }
-
-    // Optional: Convert conserved variables to primitive variables (e.g., density, velocity, pressure)
-    GlobalConservedToPrimitive();
-
-    // -------------------------------
-    // Compute residual norms (optional but useful for monitoring convergence)
-    double sumMass = 0.0, sumMomX = 0.0, sumMomY = 0.0, sumEng = 0.0;
-    for (int i = ghost; i < imax + ghost; ++i) { // Loop should exclude ghost cells
-        for (int j = ghost; j < jmax + ghost; ++j) {
-            sumMass += R_int[i][j].rho * R_int[i][j].rho;
-            sumMomX += R_int[i][j].rhou * R_int[i][j].rhou;  // momentum in x-direction
-            sumMomY += R_int[i][j].rhov * R_int[i][j].rhov;  // momentum in y-direction
-            sumEng  += R_int[i][j].E * R_int[i][j].E;
-        }
-    }
-
-    double currentMass = sqrt(sumMass / (imax * jmax));
-    double currentMomX = sqrt(sumMomX / (imax * jmax));
-    double currentMomY = sqrt(sumMomY / (imax * jmax));
-    double currentEng  = sqrt(sumEng / (imax * jmax));
-
-    // Normalize the residuals, based on the initial values
-    static bool normBaseSet = false;
-    static double initMass = 0.0, initMomX = 0.0, initMomY = 0.0, initEng = 0.0;
-    if (!normBaseSet) {
-        initMass = currentMass;
-        initMomX = currentMomX;
-        initMomY = currentMomY;
-        initEng  = currentEng;
-        normBaseSet = true;
-    }
-
-    double resMass_norm = (fabs(initMass) < 1e-12 ? currentMass : currentMass / initMass);
-    double resMomX_norm = (fabs(initMomX) < 1e-12 ? currentMomX : currentMomX / initMomX);  // normalize x-direction momentum
-    double resMomY_norm = (fabs(initMomY) < 1e-12 ? currentMomY : currentMomY / initMomY);  // normalize y-direction momentum
-    double resEng_norm  = (fabs(initEng)  < 1e-12 ? currentEng  : currentEng / initEng);
-
-    cout << "Residual Norms (Normalized): Mass = " << resMass_norm
-         << ", Momentum (x-direction) = " << resMomX_norm
-         << ", Momentum (y-direction) = " << resMomY_norm
-         << ", Energy = " << resEng_norm << endl;
-
-    double combinedResidual = std::max({resMass_norm, resMomX_norm, resMomY_norm, resEng_norm});
-    cout << "[INFO] Combined residual: " << combinedResidual << endl;
-
-    ResidualTriple residualData;
-    residualData.mass = resMass_norm;
-    residualData.mom = std::max(resMomX_norm, resMomY_norm);  // Combined momentum norm
-    residualData.eng = resEng_norm;
-    residualData.combined = combinedResidual;
-
-    return residualData;
+    double n = double(imax*jmax);
+    ResidualTriple r;
+    r.mass     = std::sqrt(sumM  / n);
+    r.mom      = std::sqrt((sumMx+sumMy) / n);
+    r.eng      = std::sqrt(sumE  / n);
+    r.combined = std::max({r.mass, r.mom, r.eng});
+    return r;
 }
 
+//------------------------------------------------------------------------------
+// 2D Tecplot dump: writes one POINT‐format zone per call.
+//  Assumes globals imax, jmax, ghost, gamma, and arrays
+//    x_cell, y_cell  (cell‐center coords, sized Ni×Nj)
+//    V                (Primitive), sized Ni×Nj
+// are all defined.
+//------------------------------------------------------------------------------
+void OutputSolution2D(const std::string &filename, int iter) {
+    // 1) Open the file
+    std::ofstream file(filename, std::ios::app);
+    if (!file) {
+        std::cerr << "Error: cannot open " << filename << " for writing\n";
+        return;
+    }
+
+    // 2) On very first call, write header
+    if (file.tellp() == 0) {
+        file << "TITLE = \"2D Euler MMS Solution\"\n"
+             << "VARIABLES = \"X\" \"Y\" \"rho\" \"u\" \"v\" \"P\" \"Mach\"\n";
+    }
+
+    // 3) Zone header
+    file << "ZONE T=\"Iteration " << iter << "\""
+         << " I=" << imax
+         << " J=" << jmax
+         << " K=1"
+         << " DATAPACKING=POINT\n";
+
+    // 4) local helper to guard against NaNs:
+    auto safe = [](double v) {
+      return std::isnan(v) ? -999.9 : v;
+    };
+
+    // 5) Dump all the physical cells
+    for (int j = ghost; j < ghost + jmax; ++j) {
+      for (int i = ghost; i < ghost + imax; ++i) {
+        const auto &Vc = V[i][j];
+        double rho  = Vc.rho;
+        double u    = Vc.u;
+        double v    = Vc.v;
+        double P    = Vc.P;
+        double a    = std::sqrt(gamma * P / rho);
+        double Mach = (std::fabs(a)<1e-12 ? 0.0 : std::sqrt(u*u + v*v)/a);
+        double x    = x_cell[i][j];
+        double y    = y_cell[i][j];
+
+        file 
+          << safe(x)    << " "
+          << safe(y)    << " "
+          << safe(rho)  << " "
+          << safe(u)    << " "
+          << safe(v)    << " "
+          << safe(P)    << " "
+          << safe(Mach) << "\n";
+      }
+    }
+
+    file.close();
+    std::cout << "[INFO] Appended 2D solution for iter=" 
+              << iter << " to " << filename << "\n";
+}
 
 
 
@@ -1386,9 +1454,55 @@ int main() {
     double dt = computeTimeStep(V, cellVolume, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j);
     std::cout << "[INFO] Computed time step: dt = " << dt << "\n";
 
-    std::vector<std::vector<Conserved>> R_int(imax, std::vector<Conserved>(jmax));  // Residuals
-    // Call UpdateSolution2D
-    ResidualTriple residuals = UpdateSolution2D(dt, fluxOrder, kappa, freezeLimiter, R_int, xmin, xmax, ymin, ymax, debugMode, dx, dy);
+    
 
-      return 0;
+    std::vector<std::vector<Conserved>> R_int(imax, std::vector<Conserved>(jmax));  // Residuals
+
+        // Pseudo-time marching parameters
+    const int maxIter = 5000;
+    const int writeInterval = 100;
+    double tol = 1e-8;             // convergence tolerance
+    ResidualTriple res{1e20,1e20,1e20,1e20};
+
+
+    for (int iter = 0; iter < maxIter; ++iter) {
+        // 1) compute a stable dt from the current primitive field V
+        double dt = computeTimeStep(
+            V, cellVolume,
+            A_face_i,   A_face_j,
+            nx_face_i,  ny_face_i,
+            nx_face_j,  ny_face_j
+        );
+
+        // 2) advance U/V by one two-stage RK step
+        rungeKutta2Step(
+            fluxOrder, kappa, freezeLimiter,
+            mmsCase, L,
+            S,              // your MMS source term
+            R_int,          // scratch for convective residual
+            dt,
+            xmin, xmax, ymin, ymax,
+            debugMode, dx, dy
+        );
+
+        // 3) every writeInterval steps, dump to Tecplot and print residual
+        if ((iter % writeInterval) == 0) {
+            // compute/update your residual‐norms
+            res = computeResidualNorms(R_int);
+            std::cout << "iter=" << iter
+                      << "  combined residual=" << res.combined
+                      << "\n";
+
+            // append a new zone at time=iter*dt
+            OutputSolution2D(solFile, iter);
+        }
+
+        // 4) optional early exit if converged
+        if (res.combined < tol) {
+            std::cout << "Converged in " << iter << " steps.\n";
+            break;
+        }
     }
+
+    return 0;
+}
