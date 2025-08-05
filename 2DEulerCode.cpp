@@ -25,6 +25,10 @@ const double epsM = 0.01;  // Minimum Mach number allowed
 const double tolerance = 1e-12;
 const double delta = 1e-6; // For computing the r
 
+std::vector<std::vector<double>> x_node;
+std::vector<std::vector<double>> y_node;
+
+
 //-----------------------------------------------------
 // Primitive and Conserved definitions
 //-----------------------------------------------------
@@ -52,12 +56,10 @@ struct Conserved {
 //-----------------------------------------------------
 
 int imax = 0, jmax = 0;
+int kmax;
 // globals, un-sized until you know imax/jmax:
 static std::vector<std::vector<Conserved>> U;  
 static std::vector<std::vector<Primitive>> V;  
-
-
-
 
 // Inline operator overloads for “Conserved”
 inline Conserved operator+(const Conserved &a, const Conserved &b) {
@@ -328,137 +330,166 @@ struct ErrorData2D {
     double eV;     // L2 error for v-velocity component
 };
 
-// 1) Read a curvilinear mesh from a .grd file (and fill the eight arrays
-//    listed above).  On return, the global imax/jmax are set from the file
-//    header.  We also automatically create two layers of ghost cells by
-//    mirror-extrapolating the interior points.
-
-inline void readCurviMeshFromFile(
-    const std::string & filepath,
-    std::vector<std::vector<double>> & x_cell,
-    std::vector<std::vector<double>> & y_cell,
-    std::vector<std::vector<double>> & A_face_i,
-    std::vector<std::vector<double>> & A_face_j,
-    std::vector<std::vector<double>> & nx_face_i,
-    std::vector<std::vector<double>> & ny_face_i,
-    std::vector<std::vector<double>> & nx_face_j,
-    std::vector<std::vector<double>> & ny_face_j,
-    double &xmin, double &xmax, double &ymin, double &ymax, double &dx, double &dy
+/// Compute face lengths and outward normals on a structured curvilinear mesh.
+/// - X, Y: node coordinates sized (imax+1)×(jmax+1)
+/// - A_face_i, nx_face_i, ny_face_i: sized (imax+1)×jmax for vertical faces
+/// - A_face_j, nx_face_j, ny_face_j: sized imax×(jmax+1) for horizontal faces
+void computeMeshGeometry(
+    const std::vector<std::vector<double>>& X,
+    const std::vector<std::vector<double>>& Y,
+    std::vector<std::vector<double>>& A_face_i,
+    std::vector<std::vector<double>>& A_face_j,
+    std::vector<std::vector<double>>& nx_face_i,
+    std::vector<std::vector<double>>& ny_face_i,
+    std::vector<std::vector<double>>& nx_face_j,
+    std::vector<std::vector<double>>& ny_face_j
 ) {
-    // 1) Open the file
-    std::ifstream in(filepath);
-    if (!in) {
-        std::cerr << "[ERROR] Cannot open mesh file: " << filepath << "\n";
-        std::exit(1);
-    }
-
-    // 2) Read nzones, imax, jmax, kmax into globals
-    int nzones, kmax;
-    in >> nzones >> imax >> jmax >> kmax;
-    assert(nzones == 1 && kmax == 2);
-
-    // 3) Compute total array dimensions (including two ghost layers on each side)
-    int Ni = imax + 2 * ghost;
-    int Nj = jmax + 2 * ghost;
-
-    for(int i=0;i<Ni;++i){
-    U[i].resize(Nj);
-    V[i].resize(Nj);
-  }
-
-    // 4) Resize all eight arrays to the correct sizes
-    x_cell.assign(Ni, std::vector<double>(Nj, 0.0));
-    y_cell.assign(Ni, std::vector<double>(Nj, 0.0));
-    A_face_i.assign(Ni + 1, std::vector<double>(Nj, 0.0));
-    A_face_j.assign(Ni, std::vector<double>(Nj + 1, 0.0));
-    nx_face_i.assign(Ni + 1, std::vector<double>(Nj, 0.0));
-    ny_face_i.assign(Ni + 1, std::vector<double>(Nj, 0.0));
-    nx_face_j.assign(Ni, std::vector<double>(Nj + 1, 0.0));
-    ny_face_j.assign(Ni, std::vector<double>(Nj + 1, 0.0));
-
-    // 5) Read interior cell-centers in the same order as the Fortran code:
-    for (int k = 1; k <= kmax; ++k) {
-        for (int j = 1; j <= jmax; ++j) {
-            for (int i = 1; i <= imax; ++i) {
-                double xx, yy;
-                in >> xx >> yy;
-                x_cell[i - 1 + ghost][j - 1 + ghost] = xx;
-                y_cell[i - 1 + ghost][j - 1 + ghost] = yy;
-            }
+    // Vertical (i‐faces): between node (i,j) → (i,j+1)
+    for (int j = 0; j < jmax; ++j) {
+        for (int i = 0; i <= imax; ++i) {
+            double dx = X[i][j+1] - X[i][j];
+            double dy = Y[i][j+1] - Y[i][j];
+            double L  = std::hypot(dx, dy);
+            A_face_i[i][j] = L;
+            // outward normal (to the left cell): rotate (dx,dy) CCW 90° → ( dy, -dx )
+            nx_face_i[i][j] =  dy / L;
+            ny_face_i[i][j] = -dx / L;
         }
     }
 
-    // 6) Mirror-extrapolate two ghost layers (i-direction and j-direction)
-    for (int i = 0; i < ghost; ++i) {
-        int iL = ghost - 1 - i;
-        int iR = ghost + imax + i;
-        for (int j = ghost; j < ghost + jmax; ++j) {
-            x_cell[iL][j] = x_cell[2 * ghost - 1 - i][j];
-            y_cell[iL][j] = y_cell[2 * ghost - 1 - i][j];
-            x_cell[iR][j] = x_cell[ghost + imax - 1 - i][j];
-            y_cell[iR][j] = y_cell[ghost + imax - 1 - i][j];
+    // Horizontal (j‐faces): between node (i,j) → (i+1,j)
+    for (int j = 0; j <= jmax; ++j) {
+        for (int i = 0; i < imax; ++i) {
+            double dx = X[i+1][j] - X[i][j];
+            double dy = Y[i+1][j] - Y[i][j];
+            double L  = std::hypot(dx, dy);
+            A_face_j[i][j] = L;
+            // outward normal (to the bottom cell): rotate (dx,dy) CW 90° → ( -dy, dx )
+            nx_face_j[i][j] = -dy / L;
+            ny_face_j[i][j] =  dx / L;
         }
     }
-
-    for (int j = 0; j < ghost; ++j) {
-        int jB = ghost - 1 - j;
-        int jT = ghost + jmax + j;
-        for (int i = 0; i < Ni; ++i) {
-            x_cell[i][jB] = x_cell[i][2 * ghost - 1 - j];
-            y_cell[i][jB] = y_cell[i][2 * ghost - 1 - j];
-            x_cell[i][jT] = x_cell[i][ghost + jmax - 1 - j];
-            y_cell[i][jT] = y_cell[i][ghost + jmax - 1 - j];
-        }
-    }
-
-    // 7) Compute vertical (i-) face lengths and outward normals
-    for (int i = 0; i <= Ni; ++i) {
-        for (int j = ghost; j < ghost + jmax; ++j) {
-            int iL = std::max(0, i - 1);
-            int iR = std::min(Ni - 1, i);
-            double dx = x_cell[iR][j] - x_cell[iL][j];
-            double dy = y_cell[iR][j] - y_cell[iL][j];
-            double len = std::sqrt(dx * dx + dy * dy);
-
-            A_face_i[i][j] = len;
-            nx_face_i[i][j] = dy / len;
-            ny_face_i[i][j] = -dx / len;
-        }
-    }
-
-    // 8) Compute horizontal (j-) face lengths and outward normals
-    for (int j = 0; j <= Nj; ++j) {
-        for (int i = ghost; i < ghost + imax; ++i) {
-            int jB = std::max(0, j - 1);
-            int jT = std::min(Nj - 1, j);
-            double dx = x_cell[i][jT] - x_cell[i][jB];
-            double dy = y_cell[i][jT] - y_cell[i][jB];
-            double len = std::sqrt(dx * dx + dy * dy);
-
-            A_face_j[i][j] = len;
-            nx_face_j[i][j] = -dy / len;
-            ny_face_j[i][j] = dx / len;
-        }
-    }
-
-    // 9) Compute the domain boundaries and grid spacings dx and dy
-    xmin = x_cell[ghost][ghost];  // Minimum x-value
-    xmax = x_cell[imax + ghost - 1][jmax + ghost - 1];  // Maximum x-value
-    ymin = y_cell[ghost][ghost];  // Minimum y-value
-    ymax = y_cell[imax + ghost - 1][jmax + ghost - 1];  // Maximum y-value
-
-    // Calculate grid spacings dx and dy
-    dx = (xmax - xmin) / imax;
-    dy = (ymax - ymin) / jmax;
-
-    // Output the domain boundaries and grid spacing
-    std::cout << "[INFO] Domain boundaries:\n";
-    std::cout << "xmin = " << xmin << ", xmax = " << xmax << "\n";
-    std::cout << "ymin = " << ymin << ", ymax = " << ymax << "\n";
-
-    std::cout << "[INFO] Grid spacings:\n";
-    std::cout << "dx = " << dx << ", dy = " << dy << std::endl;
 }
+
+
+// mirror-pad an im×jm array into (im+2*ghost)×(jm+2*ghost)
+template<typename T>
+static std::vector<std::vector<T>> padWithGhosts2D(
+    const std::vector<std::vector<T>>& in,
+    int ghost
+) {
+    int im = in.size();
+    int jm = in.empty() ? 0 : in[0].size();
+    int I  = im + 2*ghost;
+    int J  = jm + 2*ghost;
+    std::vector<std::vector<T>> out(I, std::vector<T>(J));
+    // copy interior
+    for(int j=0;j<jm;++j)
+      for(int i=0;i<im;++i)
+        out[i+ghost][j+ghost] = in[i][j];
+    // mirror left/right
+    for(int j=ghost;j<ghost+jm;++j)
+      for(int g=0;g<ghost;++g){
+        out[g][j]           = out[2*ghost-1-g][j];
+        out[ghost+im+g][j]  = out[ghost+im-1-g][j];
+      }
+    // mirror bottom/top
+    for(int i=0;i<I;++i)
+      for(int g=0;g<ghost;++g){
+        out[i][g]           = out[i][2*ghost-1-g];
+        out[i][ghost+jm+g]  = out[i][ghost+jm-1-g];
+      }
+    return out;
+}
+
+/// Reads your .grd, builds Xn/Yn→cell-centers & face normals, pads ghosts.
+/// Fills globals x_node,y_node and the passed-in eight arrays + returns bbox & dx,dy.
+void readCurviMeshFromFile(
+    const std::string & filepath,
+    std::vector<std::vector<double>>& x_cell,
+    std::vector<std::vector<double>>& y_cell,
+    std::vector<std::vector<double>>& A_face_i,
+    std::vector<std::vector<double>>& A_face_j,
+    std::vector<std::vector<double>>& nx_face_i,
+    std::vector<std::vector<double>>& ny_face_i,
+    std::vector<std::vector<double>>& nx_face_j,
+    std::vector<std::vector<double>>& ny_face_j,
+    double & xmin, double & xmax,
+    double & ymin, double & ymax,
+    double & dx,   double & dy
+) {
+    std::ifstream in(filepath);
+    if (!in) { std::cerr<<"[ERROR] Open "<<filepath<<"\n"; std::exit(1); }
+    int nz; in>>nz>>imax>>jmax>>kmax;
+    assert(nz==1 && kmax==2);
+
+    // 1) Read node planes (keep k=0 only)
+    std::vector<std::vector<double>> Xn(imax+1, std::vector<double>(jmax+1));
+    std::vector<std::vector<double>> Yn(imax+1, std::vector<double>(jmax+1));
+    double tmp;
+    for(int k=0;k<kmax;++k)
+      for(int j=0;j<=jmax;++j)
+        for(int i=0;i<=imax;++i){
+          in>>tmp;
+          if(k==0) Xn[i][j]=tmp;
+        }
+    for(int k=0;k<kmax;++k)
+      for(int j=0;j<=jmax;++j)
+        for(int i=0;i<=imax;++i){
+          in>>tmp;
+          if(k==0) Yn[i][j]=tmp;
+        }
+    // skip Z
+    for(int k=0;k<kmax;++k)
+      for(int j=0;j<=jmax;++j)
+        for(int i=0;i<=imax;++i) in>>tmp;
+
+    // save for Tecplot
+    x_node = Xn;
+    y_node = Yn;
+
+    // 2) bbox & estimates
+    xmin = Xn[0][0];        xmax = Xn[imax][jmax];
+    ymin = Yn[0][0];        ymax = Yn[imax][jmax];
+    dx   = (xmax - xmin)/imax;
+    dy   = (ymax - ymin)/jmax;
+
+    // 3) cell‐centers
+    x_cell.assign(imax, std::vector<double>(jmax));
+    y_cell.assign(imax, std::vector<double>(jmax));
+    for(int j=0;j<jmax;++j)
+      for(int i=0;i<imax;++i){
+        x_cell[i][j] = 0.25*(Xn[i][j]   + Xn[i+1][j]
+                           + Xn[i][j+1] + Xn[i+1][j+1]);
+        y_cell[i][j] = 0.25*(Yn[i][j]   + Yn[i+1][j]
+                           + Yn[i][j+1] + Yn[i+1][j+1]);
+      }
+
+    // 4) face normals & lengths
+    A_face_i .assign(imax+1, std::vector<double>(jmax));
+    nx_face_i.assign(imax+1, std::vector<double>(jmax));
+    ny_face_i.assign(imax+1, std::vector<double>(jmax));
+    A_face_j .assign(imax,   std::vector<double>(jmax+1));
+    nx_face_j.assign(imax,   std::vector<double>(jmax+1));
+    ny_face_j.assign(imax,   std::vector<double>(jmax+1));
+    computeMeshGeometry(
+      Xn, Yn,
+      A_face_i, A_face_j,
+      nx_face_i, ny_face_i,
+      nx_face_j, ny_face_j
+    );
+
+    // 5) now pad ghosts
+    x_cell     = padWithGhosts2D(x_cell,     ghost);
+    y_cell     = padWithGhosts2D(y_cell,     ghost);
+    A_face_i   = padWithGhosts2D(A_face_i,   ghost);
+    nx_face_i  = padWithGhosts2D(nx_face_i,  ghost);
+    ny_face_i  = padWithGhosts2D(ny_face_i,  ghost);
+    A_face_j   = padWithGhosts2D(A_face_j,   ghost);
+    nx_face_j  = padWithGhosts2D(nx_face_j,  ghost);
+    ny_face_j  = padWithGhosts2D(ny_face_j,  ghost);
+}
+
 
 
 // 2) Overwrite everything (cell-centers, face lengths, normals) with a uniform
@@ -466,7 +497,6 @@ inline void readCurviMeshFromFile(
 //    After calling this, you can run your solver exactly as if you had a
 //    curvilinear grid-because the same eight arrays are filled, but in a trivial
 //    Cartesian way.
-
 inline std::tuple<double,double,double,double,double,double>
 convertToCartesianDebug(
     double L,
@@ -479,42 +509,40 @@ convertToCartesianDebug(
     std::vector<std::vector<double>>& nx_face_j,
     std::vector<std::vector<double>>& ny_face_j
 ) {
-    // total array size including ghost‐layers
-    int Ni = imax + 2*ghost;
-    int Nj = jmax + 2*ghost;
+    int Ni = imax + 2 * ghost;
+    int Nj = jmax + 2 * ghost;
 
-    // **Use imax−1** so that
-    //   i = ghost   → x = 0
-    //   i = ghost + (imax−1) → x = L
-    double dx = L / double(imax);
+    double dx = L / double(imax);  // imax interior cells => imax divisions
     double dy = L / double(jmax);
 
-    // resize
+    // Allocate
     x_cell.assign(Ni, std::vector<double>(Nj));
     y_cell.assign(Ni, std::vector<double>(Nj));
 
-    // fill *cell‐centers* so that the first interior is at x=0,
-    // the last interior is at x=L
     for (int i = 0; i < Ni; ++i) {
-      for (int j = 0; j < Nj; ++j) {
-        x_cell[i][j] = (i - ghost + 0.5)*dx;
-        y_cell[i][j] = (j - ghost + 0.5)*dy;
-      }
+        for (int j = 0; j < Nj; ++j) {
+            x_cell[i][j] = dx * (i - ghost + 0.5);  // center of each cell
+            y_cell[i][j] = dy * (j - ghost + 0.5);
+        }
     }
 
-    // face‐areas & normals for a uniform Cartesian mesh
-    A_face_i.assign(Ni+1, std::vector<double>(Nj, dy));
-    nx_face_i.assign(Ni+1, std::vector<double>(Nj, 1.0));
-    ny_face_i.assign(Ni+1, std::vector<double>(Nj, 0.0));
-    A_face_j.assign(Ni,   std::vector<double>(Nj+1, dx));
-    nx_face_j.assign(Ni,   std::vector<double>(Nj+1, 0.0));
-    ny_face_j.assign(Ni,   std::vector<double>(Nj+1, 1.0));
+    // Face areas and normals
+    A_face_i.assign(Ni + 1, std::vector<double>(Nj, dy));
+    nx_face_i.assign(Ni + 1, std::vector<double>(Nj, 1.0));
+    ny_face_i.assign(Ni + 1, std::vector<double>(Nj, 0.0));
 
-    // return true physical extents and spacings
-    return { 0.0, L, 0.0, L, dx, dy };
+    A_face_j.assign(Ni, std::vector<double>(Nj + 1, dx));
+    nx_face_j.assign(Ni, std::vector<double>(Nj + 1, 0.0));
+    ny_face_j.assign(Ni, std::vector<double>(Nj + 1, 1.0));
+
+    // Physical domain
+    double xmin = 0.0;
+    double xmax = L;
+    double ymin = 0.0;
+    double ymax = L;
+
+    return {xmin, xmax, ymin, ymax, dx, dy};
 }
-
-
 
 
 
@@ -1012,7 +1040,7 @@ double computeTimeStep(
 
 // Compute area of cell (i,j) using diagonals AC and BD
 double computeCellArea(
-    int i, int j,
+    int i , int j ,
     const std::vector<std::vector<double>>& x_cell,
     const std::vector<std::vector<double>>& y_cell
 ) {
@@ -1336,66 +1364,73 @@ ResidualTriple computeResidualNorms(
 // are all defined.
 //------------------------------------------------------------------------------
 void OutputSolution2D(const std::string &filename, int iter) {
-    // 1) Open the file
     std::ofstream file(filename, std::ios::app);
     if (!file) {
         std::cerr << "Error: cannot open " << filename << " for writing\n";
         return;
     }
 
-    // 2) On very first call, write header
-    if (file.tellp() == 0) {
-        file << "TITLE = \"2D Euler MMS Solution\"\n"
-             << "VARIABLES = \"X\" \"Y\" \"rho\" \"u\" \"v\" \"P\" \"Mach\"\n";
-    }
+    file << "TITLE = \"2D Euler MMS Solution\"\n";
+    file << "VARIABLES = \"X\" \"Y\" \"rho\" \"u\" \"v\" \"P\" \"Mach\"\n";
+    file << "ZONE I=" << imax+1 << " J=" << jmax+1
+         << ", DATAPACKING=BLOCK\n";
+    file << "VARLOCATION=([3-7]=CELLCENTERED)\n";
 
-    // 3) Zone header
-    file << "ZONE T=\"Iteration " << iter << "\""
-         << " I=" << imax
-         << " J=" << jmax
-         << " K=1"
-         << " DATAPACKING=POINT\n";
-
-    // 4) local helper to guard against NaNs:
+    // Helper to guard against NaNs
     auto safe = [](double v) {
-      return std::isnan(v) ? -999.9 : v;
+        return std::isnan(v) ? -999.9 : v;
     };
 
-    // 5) Dump all the physical cells
-    for (int j = ghost; j < ghost + jmax; ++j) {
-      for (int i = ghost; i < ghost + imax; ++i) {
-        const auto &Vc = V[i][j];
-        double rho  = Vc.rho;
-        double u    = Vc.u;
-        double v    = Vc.v;
-        double P    = Vc.P;
-        double a    = std::sqrt(gamma * P / rho);
-        double Mach = (std::fabs(a)<1e-12 ? 0.0 : std::sqrt(u*u + v*v)/a);
-        double x    = x_cell[i][j];
-        double y    = y_cell[i][j];
+    // 3. Dump X block (NODAL)
+    for (int j = 0; j <= jmax; ++j)
+      for (int i = 0; i <= imax; ++i)
+        file << x_node[i][j] << "\n";
 
-        file 
-          << safe(x)    << " "
-          << safe(y)    << " "
-          << safe(rho)  << " "
-          << safe(u)    << " "
-          << safe(v)    << " "
-          << safe(P)    << " "
-          << safe(Mach) << "\n";
-      }
+
+    // 4. Dump Y block (NODAL)
+    for (int j = 0; j <= jmax; ++j)
+      for (int i = 0; i <= imax; ++i)
+        file << y_node[i][j] << "\n";
+
+
+    for (int j = 0; j < jmax; ++j)
+      for (int i = 0; i < imax; ++i)
+        file << V[i+ghost][j+ghost].rho << "\n";
+
+    for (int j = 0; j < jmax; ++j)
+      for (int i = 0; i < imax; ++i)
+        file << V[i+ghost][j+ghost].u << "\n";
+
+    for (int j = 0; j < jmax; ++j)
+      for (int i = 0; i < imax; ++i)
+        file << V[i+ghost][j+ghost].v << "\n";
+
+    for (int j = 0; j < jmax; ++j)
+      for (int i = 0; i < imax; ++i)
+        file << V[i+ghost][j+ghost].P << "\n";
+
+    for (int j = 0; j < jmax; ++j)
+      for (int i = 0; i < imax; ++i) {
+        double rho = V[i+ghost][j+ghost].rho;
+        double u = V[i+ghost][j+ghost].u;
+        double v = V[i+ghost][j+ghost].v;
+        double P = V[i+ghost][j+ghost].P;
+        double a = std::sqrt(gamma * P / rho);
+        double mach = std::sqrt(u*u + v*v) / a;
+        file << mach << "\n";
     }
-
     file.close();
-    std::cout << "[INFO] Appended 2D solution for iter=" 
-              << iter << " to " << filename << "\n";
+    std::cout << "[INFO] Appended 2D solution for iter=" << iter
+              << " to " << filename << " in BLOCK format\n";
 }
+
 
 
 int main() {
 
   int fluxOrder = 2;  // Second-order MUSCL
   double kappa = 0.5; // Choose limiter parameter (e.g., -1, 0, 0.5, or 1)
-  bool freezeLimiter = false;  // Set to true for pure MUSCL (no limiter)
+  bool freezeLimiter = true;  // Set to true for pure MUSCL (no limiter)
 
     // Create an output folder if needed.
     string outFolder = "OutputFiles";
@@ -1412,29 +1447,45 @@ int main() {
     solOut.close();
     
     // 1) Construct the folder / file you want to read:
-    const std::string meshFile = R"(C:\Users\monicashanmugam\OneDrive - Virginia Tech\Desktop\Virginia Tech\CFD\Project\Project_Files\Project_Files\Grids\curviliniear-grids\curv2d9.grd)";
+    const std::string meshFile = R"(C:\Users\monicashanmugam\OneDrive - Virginia Tech\Desktop\Virginia Tech\CFD\Projectv2\Project_Files\Project_Files\Grids\curviliniear-grids\curv2d17.grd)";
 
     // 2) Decide whether you want to run in DEBUG (Cartesian) mode
-    bool debugMode = true;  // set true if you want a simple Cartesian mesh  
+    bool debugMode = false;  // set true if you want a simple Cartesian mesh  
     
     double xmin, xmax, ymin, ymax, dx, dy;
     
     if (!debugMode) {
-      readCurviMeshFromFile(meshFile, x_cell, y_cell, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j, xmin, xmax, ymin, ymax, dx, dy);
+      readCurviMeshFromFile(meshFile,x_cell, y_cell,A_face_i, A_face_j,nx_face_i, ny_face_i,nx_face_j, ny_face_j,xmin, xmax, ymin, ymax,dx, dy);
+
       std::cout << "[INFO] Loaded curvi mesh with imax = " << imax << ", jmax = " << jmax << "\n";
     }
     else {
       // in debug mode, only read imax/jmax and then overwrite with Cartesian:
-      {
+      
         std::ifstream in(meshFile);
+        if(!in){
+          std::cerr << "Error cannot open mesh file. \n";
+          std::exit(EXIT_FAILURE);
+        }
         int nz, kmax;
         in >> nz >> imax >> jmax >> kmax;
         assert(nz == 1 && kmax == 2);
-      }
     
       std::tie(xmin, xmax, ymin, ymax, dx, dy) = convertToCartesianDebug(L, x_cell, y_cell, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j);
       std::cout << "[INFO] Using debug Cartesian mesh: imax="<<imax<<", jmax="<<jmax<<"\n";
+
+      // 🟩 Add this to generate nodal coordinates
+      x_node.resize(imax + 1, std::vector<double>(jmax + 1));
+      y_node.resize(imax + 1, std::vector<double>(jmax + 1));
+
+      for (int j = 0; j <= jmax; ++j) {
+        for (int i = 0; i <= imax; ++i) {
+            x_node[i][j] = i * dx;
+            y_node[i][j] = j * dy;
+        }
       
+      }
+
     }
 
     // ---------------------------------------------------
@@ -1476,9 +1527,6 @@ int main() {
         }
     }
 
-    
-
-
     std::cout << "[INFO] Sample values from A_face_i and A_face_j:\n";
     for (int i = 0; i < 5; ++i) {  // Print first 5 values for A_face_i and A_face_j
         std::cout << "A_face_i[" << i << "] = " << A_face_i[i][0] << ", A_face_j[" << i << "] = " << A_face_j[i][0] << "\n";
@@ -1515,7 +1563,7 @@ int main() {
     std::vector<std::vector<Conserved>> R_int(imax, std::vector<Conserved>(jmax));  // Residuals
 
         // Pseudo-time marching parameters
-    const int maxIter = 10;
+    const int maxIter = 1;
     const int writeInterval = 100;
     double tol = 1e-8;             // convergence tolerance
     ResidualTriple res{1e20,1e20,1e20,1e20};
