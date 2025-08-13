@@ -1752,6 +1752,28 @@ int main() {
     GlobalPrimitiveToConserved();
     OutputSolution2D(solFile, 0);
 
+    std::vector<std::vector<Conserved>> R0;
+    computeResidualMMS(fluxOrder, kappa, freezeLimiter, x_cell, y_cell, V, S, R0);
+
+    // helper to volume-normalize a residual field
+    auto volNorm = [&](const std::vector<std::vector<Conserved>>& Rin){
+        auto Q = Rin;
+        for (int i = ghost; i < ghost + imax; ++i)
+          for (int j = ghost; j < ghost + jmax; ++j) {
+            double vol = cellVolume[i][j];
+            Q[i][j].rho  /= vol;
+            Q[i][j].rhou /= vol;
+            Q[i][j].rhov /= vol;
+            Q[i][j].E    /= vol;
+          }
+        return Q;
+    };
+
+    ResidualTriple base_raw = computeResidualNorms(R0);
+    ResidualTriple base_vol = computeResidualNorms(volNorm(R0));
+
+    std::cout << "[INIT] L2 residual  raw=" << base_raw.combined << "  perVol=" << base_vol.combined << "\n";
+
     double dt = computeTimeStep(V, cellVolume, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j);
     std::cout << "[INFO] Computed time step: dt = " << dt << "\n";
     
@@ -1787,8 +1809,17 @@ int main() {
 
         std::vector<std::vector<Conserved>> R_now;
         computeResidualMMS(fluxOrder, kappa, freezeLimiter, x_cell, y_cell, V, S, R_now);
-        res = computeResidualNorms(R_now);
-        std::cout << "iter=" << iter << "  ||R+S|| (final state) = " << res.combined << "\n";
+        auto cur_raw = computeResidualNorms(R_now);
+        auto cur_vol = computeResidualNorms(volNorm(R_now));
+
+        // safe normalization
+        auto nd = [](double a, double b){ return a / std::max(b, 1e-300); };
+
+        std::cout << "iter=" << iter
+          << "  L2 residual: raw=" << cur_raw.combined
+          << " (norm=" << nd(cur_raw.combined, base_raw.combined) << ")"
+          << "  perVol=" << cur_vol.combined
+          << " (norm=" << nd(cur_vol.combined, base_vol.combined) << ")\n";
 
 
         // 3) every writeInterval steps, dump to Tecplot and print residual
