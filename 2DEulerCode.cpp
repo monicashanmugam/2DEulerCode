@@ -7,6 +7,8 @@
 #include <cassert>
 #include <filesystem>  
 #include <tuple>
+#include <cstdlib>
+
 
 
 using namespace std;
@@ -20,7 +22,7 @@ constexpr double Rgas      = 287.0;  // [J/(kg·K)]
 constexpr double gamma = 1.4;
 constexpr double L = 1.0; //domain length
 static constexpr int ghost = 2;
-const double CFL = 0.1;    // CFL number for time step control
+const double CFL = 0.02;    // CFL number for time step control
 const double epsM = 0.01;  // Minimum Mach number allowed
 const double tolerance = 1e-12;
 const double delta = 1e-6; // For computing the r
@@ -330,6 +332,8 @@ struct ErrorData2D {
     double eV;     // L2 error for v-velocity component
 };
 
+
+
 /// Compute face lengths and outward normals on a structured curvilinear mesh.
 /// - X, Y: node coordinates sized (imax+1)×(jmax+1)
 /// - A_face_i, nx_face_i, ny_face_i: sized (imax+1)×jmax for vertical faces
@@ -371,41 +375,60 @@ void computeMeshGeometry(
     }
 }
 
-
-// mirror-pad an im×jm array into (im+2*ghost)×(jm+2*ghost)
-template<typename T>
-static std::vector<std::vector<T>> padWithGhosts2D(
-    const std::vector<std::vector<T>>& in,
-    int ghost
-) {
-    int im = in.size();
-    int jm = in.empty() ? 0 : in[0].size();
-    int I  = im + 2*ghost;
-    int J  = jm + 2*ghost;
-    std::vector<std::vector<T>> out(I, std::vector<T>(J));
-    // copy interior
-    for(int j=0;j<jm;++j)
-      for(int i=0;i<im;++i)
-        out[i+ghost][j+ghost] = in[i][j];
-    // mirror left/right
-    for(int j=ghost;j<ghost+jm;++j)
-      for(int g=0;g<ghost;++g){
-        out[g][j]           = out[2*ghost-1-g][j];
-        out[ghost+im+g][j]  = out[ghost+im-1-g][j];
-      }
-    // mirror bottom/top
-    for(int i=0;i<I;++i)
-      for(int g=0;g<ghost;++g){
-        out[i][g]           = out[i][2*ghost-1-g];
-        out[i][ghost+jm+g]  = out[i][ghost+jm-1-g];
-      }
-    return out;
+// ---------- tiny helpers ----------
+inline double tri_area(double xa,double ya,double xb,double yb,double xc,double yc){
+    return 0.5*std::abs((xb-xa)*(yc-ya) - (yb-ya)*(xc-xa));
 }
 
-/// Reads your .grd, builds Xn/Yn→cell-centers & face normals, pads ghosts.
-/// Fills globals x_node,y_node and the passed-in eight arrays + returns bbox & dx,dy.
+template<typename T>
+std::vector<std::vector<T>> padWithGhosts2D(const std::vector<std::vector<T>>& in, int g){
+    int im = (int)in.size(); if (!im) return in;
+    int jm = (int)in[0].size();
+    std::vector<std::vector<T>> out(im+2*g, std::vector<T>(jm+2*g));
+    for(int i=0;i<im;++i) for(int j=0;j<jm;++j) out[i+g][j+g]=in[i][j];
+    for(int j=g;j<g+jm;++j) for(int q=0;q<g;++q){ out[g-1-q][j]=out[g+q][j]; out[g+im+q][j]=out[g+im-1-q][j]; }
+    for(int i=0;i<im+2*g;++i) for(int q=0;q<g;++q){ out[i][g-1-q]=out[i][g+q]; out[i][g+jm+q]=out[i][g+jm-1-q]; }
+    return out;
+}
+static void padFacesScalar(std::vector<std::vector<double>>& A, int g){
+    int I=(int)A.size(), J=(I? (int)A[0].size():0); if(!I||!J||!g) return;
+    for(int j=g;j<=J-g-1;++j) for(int q=0;q<g;++q){ A[q][j]=A[2*g-1-q][j]; A[I-g+q][j]=A[I-g-1-q][j]; }
+    for(int i=0;i<I;++i) for(int q=0;q<g;++q){ A[i][q]=A[i][2*g-1-q]; A[i][J-g+q]=A[i][J-g-1-q]; }
+}
+static void padFacesNormal(std::vector<std::vector<double>>& nx,
+                           std::vector<std::vector<double>>& ny, int g){
+    int I=(int)nx.size(), J=(I? (int)nx[0].size():0); if(!I||!J||!g) return;
+    for(int j=g;j<=J-g-1;++j) for(int q=0;q<g;++q){
+        int il=2*g-1-q, ir=I-g-1-q;
+        nx[q][j]=-nx[il][j]; ny[q][j]=-ny[il][j];
+        nx[I-g+q][j]=-nx[ir][j]; ny[I-g+q][j]=-ny[ir][j];
+    }
+    for(int i=0;i<I;++i) for(int q=0;q<g;++q){
+        int jb=2*g-1-q, jt=J-g-1-q;
+        nx[i][q]=-nx[i][jb]; ny[i][q]=-ny[i][jb];
+        nx[i][J-g+q]=-nx[i][jt]; ny[i][J-g+q]=-ny[i][jt];
+    }
+}
+// unsnake rows/cols so adjacency is consistent
+static void harmonize_ordering(std::vector<std::vector<double>>& Xn,
+                               std::vector<std::vector<double>>& Yn){
+    int Ni=(int)Xn.size(), Nj=(int)Xn[0].size();
+    auto rowsign=[&](int j){ return (Xn[Ni-1][j]-Xn[0][j] >= 0) ? 1: -1; };
+    auto colsign=[&](int i){ return (Yn[i][Nj-1]-Yn[i][0] >= 0) ? 1: -1; };
+    int rs=rowsign(0); for(int j=1;j<Nj;++j) if (rowsign(j)*rs<0)
+        for(int i=0;i<Ni/2;++i){ std::swap(Xn[i][j],Xn[Ni-1-i][j]); std::swap(Yn[i][j],Yn[Ni-1-i][j]); }
+    int cs=colsign(0); for(int i=1;i<Ni;++i) if (colsign(i)*cs<0)
+        for(int j=0;j<Nj/2;++j){ std::swap(Xn[i][j],Xn[i][Nj-1-j]); std::swap(Yn[i][j],Yn[i][Nj-1-j]); }
+}
+
+// Reads a 2D curvilinear .grd with header:
+//   nz
+//   Ni_nodes  Nj_nodes  kplanes
+// X-block (kplanes planes; use plane 0), Y-block (kplanes; use plane 0), Z-block (ignored)
+// Builds: x_node/y_node (no ghosts), and padded x_cell/y_cell, faces, normals, cellVolume.
+// Sets global imax = Ni-1, jmax = Nj-1. Uses global `ghost`.
 void readCurviMeshFromFile(
-    const std::string & filepath,
+    const std::string& path,
     std::vector<std::vector<double>>& x_cell,
     std::vector<std::vector<double>>& y_cell,
     std::vector<std::vector<double>>& A_face_i,
@@ -414,92 +437,175 @@ void readCurviMeshFromFile(
     std::vector<std::vector<double>>& ny_face_i,
     std::vector<std::vector<double>>& nx_face_j,
     std::vector<std::vector<double>>& ny_face_j,
-    double & xmin, double & xmax,
-    double & ymin, double & ymax,
-    double & dx,   double & dy
+    std::vector<std::vector<double>>& cellVolume, // <-- padded volume
+    double& xmin, double& xmax, double& ymin, double& ymax, double& dx, double& dy
 ) {
-    std::ifstream in(filepath);
-    if (!in) { std::cerr<<"[ERROR] Open "<<filepath<<"\n"; std::exit(1); }
-    int nz; in>>nz>>imax>>jmax>>kmax;
-    assert(nz==1 && kmax==2);
+    std::ifstream in(path);
+    if (!in) { std::cerr << "[ERROR] Cannot open mesh file: " << path << "\n"; std::exit(EXIT_FAILURE); }
 
-    // 1) Read node planes (keep k=0 only)
-    std::vector<std::vector<double>> Xn(imax+1, std::vector<double>(jmax+1));
-    std::vector<std::vector<double>> Yn(imax+1, std::vector<double>(jmax+1));
+    int nz, Ni_nodes, Nj_nodes, kplanes;
+    in >> nz >> Ni_nodes >> Nj_nodes >> kplanes;
+    if (!(nz == 1 && kplanes >= 1)) {
+        std::cerr << "[ERROR] Bad .grd header (nz or kplanes)\n"; std::exit(EXIT_FAILURE);
+    }
+
+    // cells = nodes - 1
+    imax = Ni_nodes - 1;
+    jmax = Nj_nodes - 1;
+
+    // --- read X (take plane 0) ---
+    std::vector<std::vector<double>> Xn(Ni_nodes, std::vector<double>(Nj_nodes));
+    std::vector<std::vector<double>> Yn(Ni_nodes, std::vector<double>(Nj_nodes));
     double tmp;
-    for(int k=0;k<kmax;++k)
-      for(int j=0;j<=jmax;++j)
-        for(int i=0;i<=imax;++i){
-          in>>tmp;
-          if(k==0) Xn[i][j]=tmp;
-        }
-    for(int k=0;k<kmax;++k)
-      for(int j=0;j<=jmax;++j)
-        for(int i=0;i<=imax;++i){
-          in>>tmp;
-          if(k==0) Yn[i][j]=tmp;
-        }
-    // skip Z
-    for(int k=0;k<kmax;++k)
-      for(int j=0;j<=jmax;++j)
-        for(int i=0;i<=imax;++i) in>>tmp;
+    for (int k = 0; k < kplanes; ++k)
+        for (int j = 0; j < Nj_nodes; ++j)
+            for (int i = 0; i < Ni_nodes; ++i) { in >> tmp; if (k == 0) Xn[i][j] = tmp; }
+    // --- read Y (take plane 0) ---
+    for (int k = 0; k < kplanes; ++k)
+        for (int j = 0; j < Nj_nodes; ++j)
+            for (int i = 0; i < Ni_nodes; ++i) { in >> tmp; if (k == 0) Yn[i][j] = tmp; }
+    // --- skip Z ---
+    for (int k = 0; k < kplanes; ++k)
+        for (int j = 0; j < Nj_nodes; ++j)
+            for (int i = 0; i < Ni_nodes; ++i) in >> tmp;
 
-    // save for Tecplot
-    x_node = Xn;
-    y_node = Yn;
+    // --- harmonize ordering (unsnake rows/cols) ---
+    auto reverse_row = [&](int j) {
+        for (int i = 0; i < Ni_nodes/2; ++i) { std::swap(Xn[i][j], Xn[Ni_nodes-1-i][j]); std::swap(Yn[i][j], Yn[Ni_nodes-1-i][j]); }
+    };
+    auto reverse_col = [&](int i) {
+        for (int j = 0; j < Nj_nodes/2; ++j) { std::swap(Xn[i][j], Xn[i][Nj_nodes-1-j]); std::swap(Yn[i][j], Yn[i][Nj_nodes-1-j]); }
+    };
+    auto rowsign = [&](int j){ return (Xn[Ni_nodes-1][j] - Xn[0][j]) >= 0 ? 1 : -1; };
+    auto colsign = [&](int i){ return (Yn[i][Nj_nodes-1] - Yn[i][0]) >= 0 ? 1 : -1; };
+    int rs = rowsign(0); for (int j = 1; j < Nj_nodes; ++j) if (rowsign(j)*rs < 0) reverse_row(j);
+    int cs = colsign(0); for (int i = 1; i < Ni_nodes; ++i) if (colsign(i)*cs < 0) reverse_col(i);
 
-    // 2) bbox & estimates
-    xmin = Xn[0][0];        xmax = Xn[imax][jmax];
-    ymin = Yn[0][0];        ymax = Yn[imax][jmax];
-    dx   = (xmax - xmin)/imax;
-    dy   = (ymax - ymin)/jmax;
+    // --- save nodal arrays for Tecplot (no ghosts) ---
+    x_node = Xn;  y_node = Yn;
 
-    // 3) cell‐centers
+    xmin = xmax = Xn[0][0];
+    ymin = ymax = Yn[0][0];
+    for (int j = 0; j < Nj_nodes; ++j)
+      for (int i = 0; i < Ni_nodes; ++i) {
+        xmin = std::min(xmin, Xn[i][j]);
+        xmax = std::max(xmax, Xn[i][j]);
+        ymin = std::min(ymin, Yn[i][j]);
+        ymax = std::max(ymax, Yn[i][j]);
+      }
+    dx = (xmax - xmin) / double(imax);
+    dy = (ymax - ymin) / double(jmax);
+
+    // --- centers (interior imax x jmax) ---
     x_cell.assign(imax, std::vector<double>(jmax));
     y_cell.assign(imax, std::vector<double>(jmax));
-    for(int j=0;j<jmax;++j)
-      for(int i=0;i<imax;++i){
-        x_cell[i][j] = 0.25*(Xn[i][j]   + Xn[i+1][j]
-                           + Xn[i][j+1] + Xn[i+1][j+1]);
-        y_cell[i][j] = 0.25*(Yn[i][j]   + Yn[i+1][j]
-                           + Yn[i][j+1] + Yn[i+1][j+1]);
-      }
+    for (int j = 0; j < jmax; ++j)
+        for (int i = 0; i < imax; ++i) {
+            x_cell[i][j] = 0.25*(Xn[i][j] + Xn[i+1][j] + Xn[i][j+1] + Xn[i+1][j+1]);
+            y_cell[i][j] = 0.25*(Yn[i][j] + Yn[i+1][j] + Yn[i][j+1] + Yn[i+1][j+1]);
+        }
 
-    // 4) face normals & lengths
-    A_face_i .assign(imax+1, std::vector<double>(jmax));
+    // --- face lengths & outward normals (interior faces) ---
+    A_face_i.assign(imax+1, std::vector<double>(jmax));
     nx_face_i.assign(imax+1, std::vector<double>(jmax));
     ny_face_i.assign(imax+1, std::vector<double>(jmax));
-    A_face_j .assign(imax,   std::vector<double>(jmax+1));
-    nx_face_j.assign(imax,   std::vector<double>(jmax+1));
-    ny_face_j.assign(imax,   std::vector<double>(jmax+1));
-    computeMeshGeometry(
-      Xn, Yn,
-      A_face_i, A_face_j,
-      nx_face_i, ny_face_i,
-      nx_face_j, ny_face_j
-    );
+    for (int j = 0; j < jmax; ++j)
+        for (int i = 0; i <= imax; ++i) {
+            double dx_ = Xn[i][j+1] - Xn[i][j];
+            double dy_ = Yn[i][j+1] - Yn[i][j];
+            double L = std::hypot(dx_, dy_);
+            A_face_i[i][j] = L;
+            nx_face_i[i][j] =  dy_ / L;  // outward from left cell
+            ny_face_i[i][j] = -dx_ / L;
+        }
 
-    // 5) now pad ghosts
-    x_cell     = padWithGhosts2D(x_cell,     ghost);
-    y_cell     = padWithGhosts2D(y_cell,     ghost);
-    A_face_i   = padWithGhosts2D(A_face_i,   ghost);
-    nx_face_i  = padWithGhosts2D(nx_face_i,  ghost);
-    ny_face_i  = padWithGhosts2D(ny_face_i,  ghost);
-    A_face_j   = padWithGhosts2D(A_face_j,   ghost);
-    nx_face_j  = padWithGhosts2D(nx_face_j,  ghost);
-    ny_face_j  = padWithGhosts2D(ny_face_j,  ghost);
+    A_face_j.assign(imax, std::vector<double>(jmax+1));
+    nx_face_j.assign(imax, std::vector<double>(jmax+1));
+    ny_face_j.assign(imax, std::vector<double>(jmax+1));
+    for (int j = 0; j <= jmax; ++j)
+        for (int i = 0; i < imax; ++i) {
+            double dx_ = Xn[i+1][j] - Xn[i][j];
+            double dy_ = Yn[i+1][j] - Yn[i][j];
+            double L = std::hypot(dx_, dy_);
+            A_face_j[i][j] = L;
+            nx_face_j[i][j] = -dy_ / L;  // outward from bottom cell
+            ny_face_j[i][j] =  dx_ / L;
+        }
+
+    // --- cell areas from nodes (interior) ---
+    cellVolume.assign(imax, std::vector<double>(jmax));
+    auto tri_area = [](double xa,double ya,double xb,double yb,double xc,double yc){
+        return 0.5*std::abs((xb-xa)*(yc-ya) - (yb-ya)*(xc-xa));
+    };
+    for (int j = 0; j < jmax; ++j)
+        for (int i = 0; i < imax; ++i) {
+            double x00 = Xn[i][j],     y00 = Yn[i][j];
+            double x10 = Xn[i+1][j],   y10 = Yn[i+1][j];
+            double x11 = Xn[i+1][j+1], y11 = Yn[i+1][j+1];
+            double x01 = Xn[i][j+1],   y01 = Yn[i][j+1];
+            cellVolume[i][j] = tri_area(x00,y00,x10,y10,x11,y11) + tri_area(x00,y00,x11,y11,x01,y01);
+        }
+
+    // --- padding helpers (mirror; normals flip sign in belts) ---
+    auto padScalar = [&](const std::vector<std::vector<double>>& in)->std::vector<std::vector<double>>{
+        int g = ghost;
+        if (in.empty() || in[0].empty() || g<=0) return in;
+        int I = (int)in.size(), J = (int)in[0].size();
+        std::vector<std::vector<double>> out(I+2*g, std::vector<double>(J+2*g));
+        for(int i=0;i<I;++i) for(int j=0;j<J;++j) out[i+g][j+g]=in[i][j];
+        for(int j=g;j<g+J;++j) for(int q=0;q<g;++q){ out[g-1-q][j]=out[g+q][j]; out[g+I+q][j]=out[g+I-1-q][j]; }
+        for(int i=0;i<I+2*g;++i) for(int q=0;q<g;++q){ out[i][g-1-q]=out[i][g+q]; out[i][g+J+q]=out[i][g+J-1-q]; }
+        return out;
+    };
+    auto padNormals = [&](std::vector<std::vector<double>>& nx,
+                          std::vector<std::vector<double>>& ny){
+        int g = ghost; if (nx.empty()||nx[0].empty()||g<=0) return;
+        int I = (int)nx.size(), J = (int)nx[0].size();
+        // left/right belts
+        for(int j=g;j<=J-g-1;++j) for(int q=0;q<g;++q){
+            int il = 2*g-1-q, ir = I-g-1-q;
+            nx[q][j]        = -nx[il][j]; ny[q][j]        = -ny[il][j];
+            nx[I-g+q][j]    = -nx[ir][j]; ny[I-g+q][j]    = -ny[ir][j];
+        }
+        // bottom/top belts
+        for(int i=0;i<I;++i) for(int q=0;q<g;++q){
+            int jb = 2*g-1-q, jt = J-g-1-q;
+            nx[i][q]        = -nx[i][jb]; ny[i][q]        = -ny[i][jb];
+            nx[i][J-g+q]    = -nx[i][jt]; ny[i][J-g+q]    = -ny[i][jt];
+        }
+    };
+
+    // --- pad everything used by the solver ---
+    x_cell     = padScalar(x_cell);
+    y_cell     = padScalar(y_cell);
+    A_face_i   = padScalar(A_face_i);
+    nx_face_i  = padScalar(nx_face_i);
+    ny_face_i  = padScalar(ny_face_i);
+    A_face_j   = padScalar(A_face_j);
+    nx_face_j  = padScalar(nx_face_j);
+    ny_face_j  = padScalar(ny_face_j);
+    cellVolume = padScalar(cellVolume);
+
+    // fix normals in ghost belts
+    padNormals(nx_face_i, ny_face_i);
+    padNormals(nx_face_j, ny_face_j);
+
+    std::cout << "[READ] nodes: " << Ni_nodes << " x " << Nj_nodes
+              << "  => cells: " << imax << " x " << jmax
+              << "  (ghost=" << ghost << ")\n";
 }
 
 
 
-// 2) Overwrite everything (cell-centers, face lengths, normals) with a uniform
-//    Cartesian grid of size imax x jmax over [0,L]x[0,L].  This is debug mode.
-//    After calling this, you can run your solver exactly as if you had a
-//    curvilinear grid-because the same eight arrays are filled, but in a trivial
-//    Cartesian way.
-inline std::tuple<double,double,double,double,double,double>
-convertToCartesianDebug(
-    double L,
+
+// Build a uniform Cartesian mesh over [0,Lx]×[0,Ly] with imax×jmax CELLS.
+// Fills x_node/y_node (no ghosts) and padded x_cell/y_cell, faces, normals, cellVolume.
+// Shapes (with ghost=g):
+//  - V,U,x_cell,y_cell,cellVolume: (imax+2g) × (jmax+2g)
+//  - A_face_i,nx_face_i,ny_face_i: (imax+1+2g) × (jmax+2g)
+//  - A_face_j,nx_face_j,ny_face_j: (imax+2g)   × (jmax+1+2g)
+void buildCartesianDebug(
+    int imax, int jmax, double Lx, double Ly, int g,
     std::vector<std::vector<double>>& x_cell,
     std::vector<std::vector<double>>& y_cell,
     std::vector<std::vector<double>>& A_face_i,
@@ -507,42 +613,55 @@ convertToCartesianDebug(
     std::vector<std::vector<double>>& nx_face_i,
     std::vector<std::vector<double>>& ny_face_i,
     std::vector<std::vector<double>>& nx_face_j,
-    std::vector<std::vector<double>>& ny_face_j
+    std::vector<std::vector<double>>& ny_face_j,
+    std::vector<std::vector<double>>& cellVolume,
+    std::vector<std::vector<double>>& x_node,
+    std::vector<std::vector<double>>& y_node,
+    double &dx, double &dy
 ) {
-    int Ni = imax + 2 * ghost;
-    int Nj = jmax + 2 * ghost;
+    // Nodes (no ghosts)
+    x_node.assign(imax+1, std::vector<double>(jmax+1));
+    y_node.assign(imax+1, std::vector<double>(jmax+1));
 
-    double dx = L / double(imax);  // imax interior cells => imax divisions
-    double dy = L / double(jmax);
+    dx = Lx / double(imax);
+    dy = Ly / double(jmax);
 
-    // Allocate
+    for (int j=0; j<=jmax; ++j)
+      for (int i=0; i<=imax; ++i) {
+        x_node[i][j] = i*dx;
+        y_node[i][j] = j*dy;
+      }
+
+    // Padded sizes
+    const int Ni = imax + 2*g;
+    const int Nj = jmax + 2*g;
+
+    // Cell centers (padded)
     x_cell.assign(Ni, std::vector<double>(Nj));
     y_cell.assign(Ni, std::vector<double>(Nj));
-
-    for (int i = 0; i < Ni; ++i) {
-        for (int j = 0; j < Nj; ++j) {
-            x_cell[i][j] = dx * (i - ghost + 0.5);  // center of each cell
-            y_cell[i][j] = dy * (j - ghost + 0.5);
-        }
+    for (int j=0; j<Nj; ++j) {
+      for (int i=0; i<Ni; ++i) {
+        // physical interior is i∈[g..g+imax-1], j∈[g..g+jmax-1]
+        const double xc = (i - g + 0.5)*dx;
+        const double yc = (j - g + 0.5)*dy;
+        x_cell[i][j] = xc;
+        y_cell[i][j] = yc;
+      }
     }
 
-    // Face areas and normals
-    A_face_i.assign(Ni + 1, std::vector<double>(Nj, dy));
-    nx_face_i.assign(Ni + 1, std::vector<double>(Nj, 1.0));
-    ny_face_i.assign(Ni + 1, std::vector<double>(Nj, 0.0));
+    // Faces (padded) — constant lengths, axis-aligned normals
+    A_face_i.assign(Ni+1, std::vector<double>(Nj, dy));
+    nx_face_i.assign(Ni+1, std::vector<double>(Nj, 1.0));
+    ny_face_i.assign(Ni+1, std::vector<double>(Nj, 0.0));
 
-    A_face_j.assign(Ni, std::vector<double>(Nj + 1, dx));
-    nx_face_j.assign(Ni, std::vector<double>(Nj + 1, 0.0));
-    ny_face_j.assign(Ni, std::vector<double>(Nj + 1, 1.0));
+    A_face_j.assign(Ni, std::vector<double>(Nj+1, dx));
+    nx_face_j.assign(Ni, std::vector<double>(Nj+1, 0.0));
+    ny_face_j.assign(Ni, std::vector<double>(Nj+1, 1.0));
 
-    // Physical domain
-    double xmin = 0.0;
-    double xmax = L;
-    double ymin = 0.0;
-    double ymax = L;
-
-    return {xmin, xmax, ymin, ymax, dx, dy};
+    // Cell volumes (padded)
+    cellVolume.assign(Ni, std::vector<double>(Nj, dx*dy));
 }
+
 
 
 
@@ -936,27 +1055,28 @@ void computeSourceTermsMMS(
   double L,
   const std::vector<std::vector<double>>& x_cell,
   const std::vector<std::vector<double>>& y_cell,
+  const std::vector<std::vector<double>>& cellVolume,   // <-- add this
   std::vector<std::vector<Conserved>>&   S
 ) {
   assert(mmsCase==1 || mmsCase==2);
   int Ni = imax + 2*ghost;
   int Nj = jmax + 2*ghost;
-
-  // allocate & zero
   S.assign(Ni, std::vector<Conserved>(Nj, Conserved{0,0,0,0}));
 
-  // fill only the physical interior
   for (int i = ghost; i < ghost+imax; ++i) {
     for (int j = ghost; j < ghost+jmax; ++j) {
       double x = x_cell[i][j];
       double y = y_cell[i][j];
-      S[i][j].rho  = rmassconv (mmsCase, L,     x, y);
-      S[i][j].rhou = xmtmconv(mmsCase, L,     x, y);
-      S[i][j].rhov = ymtmconv(mmsCase, L,     x, y);
-      S[i][j].E    = energyconv(mmsCase, gamma, L, x, y);
+      double vol = cellVolume[i][j];
+      // source density (per volume) * volume -> integral
+      S[i][j].rho  = rmassconv (mmsCase, L, x, y) * vol;
+      S[i][j].rhou = xmtmconv  (mmsCase, L, x, y) * vol;
+      S[i][j].rhov = ymtmconv  (mmsCase, L, x, y) * vol;
+      S[i][j].E    = energyconv(mmsCase, gamma, L, x, y) * vol;
     }
   }
 }
+
 
 
 void applyBoundaryConditions(
@@ -1005,36 +1125,53 @@ double computeTimeStep(
     const std::vector<std::vector<double>>& nx_face_j,
     const std::vector<std::vector<double>>& ny_face_j
 ) {
-    double dtMin = 1e10;
 
-    for (int i = ghost; i < imax + ghost; ++i) {
-        for (int j = ghost; j < jmax + ghost; ++j) {
-            const Primitive& Vcell = V[i][j];
-            double a = std::sqrt(gamma * Vcell.P / Vcell.rho);
-            double u = Vcell.u;
-            double v = Vcell.v;
+     double dtMin = 1e10;
+        for (int i = ghost; i < ghost + imax; ++i) {
+          for (int j = ghost; j < ghost + jmax; ++j) {
+           const Primitive& Vcell = V[i][j];
+            double rho = std::max(Vcell.rho, RHO_MIN);
+            double P   = std::max(Vcell.P,   P_MIN);
+            double a   = std::sqrt(gamma * P / rho);
+            double u = Vcell.u, v = Vcell.v;
 
-            // Eigenvalues across each face
-            double lambda_iL = std::abs(u * nx_face_i[i][j] + v * ny_face_i[i][j]) + a;
+            double lambda_iL = std::abs(u * nx_face_i[i][j]   + v * ny_face_i[i][j])   + a;
             double lambda_iR = std::abs(u * nx_face_i[i+1][j] + v * ny_face_i[i+1][j]) + a;
-
-            double lambda_jB = std::abs(u * nx_face_j[i][j] + v * ny_face_j[i][j]) + a;
+            double lambda_jB = std::abs(u * nx_face_j[i][j]   + v * ny_face_j[i][j])   + a;
             double lambda_jT = std::abs(u * nx_face_j[i][j+1] + v * ny_face_j[i][j+1]) + a;
 
-            double areaSum =
-                lambda_iL * A_face_i[i][j] +
-                lambda_iR * A_face_i[i+1][j] +
-                lambda_jB * A_face_j[i][j] +
-                lambda_jT * A_face_j[i][j+1];
+            double areaSum = lambda_iL * A_face_i[i][j]
+                           + lambda_iR * A_face_i[i+1][j]
+                           + lambda_jB * A_face_j[i][j]
+                           + lambda_jT * A_face_j[i][j+1];
 
+            if (areaSum <= 1e-14) continue; // skip degenerate cell
             double dt_cell = CFL * cellVolume[i][j] / areaSum;
-
-            if (dt_cell < dtMin) dtMin = dt_cell;
+            if (std::isfinite(dt_cell) && dt_cell < dtMin) dtMin = dt_cell;
+          }
         }
+        return dtMin;
     }
 
-    return dtMin;
+
+// Area of cell (i,j) from *nodal* corners: (i,j), (i+1,j), (i+1,j+1), (i,j+1)
+inline double cellAreaFromNodes(
+    int i, int j,
+    const std::vector<std::vector<double>>& Xn,
+    const std::vector<std::vector<double>>& Yn)
+{
+    const double x00 = Xn[i  ][j  ], y00 = Yn[i  ][j  ];
+    const double x10 = Xn[i+1][j  ], y10 = Yn[i+1][j  ];
+    const double x11 = Xn[i+1][j+1], y11 = Yn[i+1][j+1];
+    const double x01 = Xn[i  ][j+1], y01 = Yn[i  ][j+1];
+
+    // split quad into two triangles: (00,10,11) + (00,11,01)
+    auto tri2 = [](double xa,double ya,double xb,double yb,double xc,double yc){
+        return 0.5*std::abs( (xb-xa)*(yc-ya) - (yb-ya)*(xc-xa) );
+    };
+    return tri2(x00,y00,x10,y10,x11,y11) + tri2(x00,y00,x11,y11,x01,y01);
 }
+
 
 
 
@@ -1074,8 +1211,9 @@ inline double safeDenom(double d, double small = delta) {
 }
 
 inline double xi_limiter(double r) {
-  return (r + std::fabs(r)) / (1.0 + r);
+  return (r + std::fabs(r)) / safeDenom(1.0 + r);
 }
+
 
 inline double Cplus(double M)  {
   if      (M<=-1) return 0.0;
@@ -1227,8 +1365,8 @@ void computeResidualMMS(
       Primitive PL, PR;
       musclI(V, i, j, fluxOrder, kappa, freezeLimiter, PL, PR);
       auto F = faceFluxVL2D(PL, PR, nx_face_i[i][j], ny_face_i[i][j], A_face_i[i][j]);
-      R[i-1][j] -= F;
-      R[i  ][j] += F;
+       R[i  ][j] += F;
+       R[i+1][j] -= F;
     }
   }
 
@@ -1239,8 +1377,8 @@ void computeResidualMMS(
       Primitive PL, PR;
       musclJ(V, i, j, fluxOrder, kappa, freezeLimiter, PL, PR);
       auto G = faceFluxVL2D(PL, PR, nx_face_j[i][j], ny_face_j[i][j], A_face_j[i][j]);
-      R[i][j-1] -= G;
-      R[i][j  ] += G;
+      R[i][j] += G;
+      R[i][j+1] -= G;
     }
   }
 
@@ -1255,76 +1393,61 @@ void computeResidualMMS(
   }
 }
 
+// replace your rungeKutta2Step(...) body with this
 void rungeKutta2Step(
     int fluxOrder, double kappa, bool freezeLimiter,
     int mmsCase, double L,
     const std::vector<std::vector<Conserved>>& S,
-    std::vector<std::vector<Conserved>>&       R_int,
+    std::vector<std::vector<Conserved>>& R_int,
     double dt,
-    double xmin, double xmax, double ymin, double ymax,
-    bool debugMode, double dx, double dy
+    const std::vector<std::vector<double>>& cellVolume,
+    bool /*debugMode*/, double /*dx*/, double /*dy*/
 ) {
-    int Ni = imax + 2*ghost;
-    int Nj = jmax + 2*ghost;
+    const int i0 = ghost, i1 = ghost + imax - 1;
+    const int j0 = ghost, j1 = ghost + jmax - 1;
 
-    // --- Stage 1: compute slope at (U,V)^n ---
-    computeResidualMMS(fluxOrder, kappa, freezeLimiter,
-                       x_cell, y_cell,
-                       V,      // global primitive V^n
-                       S,
-                       R_int);
+    // Stage 1 @ V^n
+    computeResidualMMS(fluxOrder, kappa, freezeLimiter, x_cell, y_cell, V, S, R_int);
+    auto R1 = R_int;                      // store
+    auto U0 = U;                          // keep original
+    auto U_star = U0;
 
-    // provisional update U* = U^n + dt * (−R_int) / vol
-    auto U_star = U;
-    for(int i=ghost; i<ghost+imax; ++i){
-      for(int j=ghost; j<ghost+jmax; ++j){
-        double vol = debugMode ? dx*dy : computeCellArea(i,j,x_cell,y_cell);
-        U_star[i][j].rho  += -dt/vol * R_int[i][j].rho;
-        U_star[i][j].rhou += -dt/vol * R_int[i][j].rhou;
-        U_star[i][j].rhov += -dt/vol * R_int[i][j].rhov;
-        U_star[i][j].E    += -dt/vol * R_int[i][j].E;
+    for (int i = i0; i <= i1; ++i)
+      for (int j = j0; j <= j1; ++j) {
+        double vol = cellVolume[i][j];
+        U_star[i][j].rho  = U0[i][j].rho  - (dt/vol)*R1[i][j].rho;
+        U_star[i][j].rhou = U0[i][j].rhou - (dt/vol)*R1[i][j].rhou;
+        U_star[i][j].rhov = U0[i][j].rhov - (dt/vol)*R1[i][j].rhov;
+        U_star[i][j].E    = U0[i][j].E    - (dt/vol)*R1[i][j].E;
       }
-    }
     applyBoundaryConditions(U_star, V, mmsCase, L, x_cell, y_cell);
 
-    // --- NEW: build V_star from U_star ---
-    std::vector<std::vector<Primitive>> V_star(Ni, std::vector<Primitive>(Nj));
-    for(int i=0; i<Ni; ++i){
-      for(int j=0; j<Nj; ++j){
+    // V* from U*
+    std::vector<std::vector<Primitive>> V_star(U_star.size(),
+                                               std::vector<Primitive>(U_star[0].size()));
+    for (int i = 0; i < (int)U_star.size(); ++i)
+      for (int j = 0; j < (int)U_star[0].size(); ++j)
         V_star[i][j] = ConservedToPrimitiveCell(U_star[i][j]);
+
+
+    // Stage 2 @ V*
+    computeResidualMMS(fluxOrder, kappa, freezeLimiter, x_cell, y_cell, V_star, S, R_int);
+    auto R2 = R_int;
+
+    // Heun average back to U^{n+1}
+    for (int i = i0; i <= i1; ++i)
+      for (int j = j0; j <= j1; ++j) {
+        double vol = cellVolume[i][j];
+        U[i][j].rho  = U0[i][j].rho  - 0.5*(dt/vol)*(R1[i][j].rho  + R2[i][j].rho);
+        U[i][j].rhou = U0[i][j].rhou - 0.5*(dt/vol)*(R1[i][j].rhou + R2[i][j].rhou);
+        U[i][j].rhov = U0[i][j].rhov - 0.5*(dt/vol)*(R1[i][j].rhov + R2[i][j].rhov);
+        U[i][j].E    = U0[i][j].E    - 0.5*(dt/vol)*(R1[i][j].E    + R2[i][j].E);
       }
-    }
 
-    // --- Stage 2: slope at (U*,V*) ---
-    computeResidualMMS(fluxOrder, kappa, freezeLimiter,
-                       x_cell, y_cell,
-                       V_star,  // <-- use the provisional primitives here
-                       S,
-                       R_int);
-
-    // --- Combine slopes for Heun (2‐stage RK) ---
-    for(int i=ghost; i<ghost+imax; ++i){
-      for(int j=ghost; j<ghost+jmax; ++j){
-        double vol = debugMode ? dx*dy : computeCellArea(i,j,x_cell,y_cell);
-        // slope1 was in R_int from Stage1, slope2 now in R_int from Stage2
-        Conserved slope1{ -R_int[i][j].rho,
-                          -R_int[i][j].rhou,
-                          -R_int[i][j].rhov,
-                          -R_int[i][j].E };
-        // (we could have stashed slope2 separately, but we re‐used R_int)
-        Conserved slope2 = slope1; // because R_int was just overwritten by Stage2
-
-        U[i][j].rho  += 0.5*dt/vol*( slope1.rho  + slope2.rho );
-        U[i][j].rhou += 0.5*dt/vol*( slope1.rhou + slope2.rhou );
-        U[i][j].rhov += 0.5*dt/vol*( slope1.rhov + slope2.rhov );
-        U[i][j].E    += 0.5*dt/vol*( slope1.E    + slope2.E    );
-      }
-    }
     applyBoundaryConditions(U, V, mmsCase, L, x_cell, y_cell);
     GlobalConservedToPrimitive();
+
 }
-
-
 
 
 // Define the ResidualTriple structure
@@ -1363,74 +1486,134 @@ ResidualTriple computeResidualNorms(
 //    V                (Primitive), sized Ni×Nj
 // are all defined.
 //------------------------------------------------------------------------------
-void OutputSolution2D(const std::string &filename, int iter) {
-    std::ofstream file(filename, std::ios::app);
-    if (!file) {
-        std::cerr << "Error: cannot open " << filename << " for writing\n";
-        return;
+// Write nodes for the mesh, and cell-centered primitives (+Mach).
+// If writeGhosts=false: writes ONLY physical domain (I=imax+1, J=jmax+1; vars size imax×jmax)
+// If writeGhosts=true : writes ghosts too (I=imax+1+2g, J=jmax+1+2g; vars size (imax+2g)×(jmax+2g))
+void OutputSolution2D(const std::string &filename, int iter, bool writeGhosts=false) {
+    std::ofstream f(filename, std::ios::app);
+    if (!f) { std::cerr << "Error: cannot open " << filename << "\n"; return; }
+
+    auto safe = [](double v){ return std::isfinite(v) ? v : -999.9; };
+    auto pos  = [](double v, double lo){ return (std::isfinite(v) && v>lo)? v : lo; };
+
+    const int g = ghost;
+    int I_nodes = writeGhosts ? (imax+1 + 2*g) : (imax+1);
+    int J_nodes = writeGhosts ? (jmax+1 + 2*g) : (jmax+1);
+    int I_cells = writeGhosts ? (imax + 2*g)   : (imax);
+    int J_cells = writeGhosts ? (jmax + 2*g)   : (jmax);
+
+    // Build nodal array to write (pad nodes only when writing ghosts)
+    std::vector<std::vector<double>> Xw, Yw;
+    if (writeGhosts) {
+        Xw = padWithGhosts2D(x_node, g);
+        Yw = padWithGhosts2D(y_node, g);
     }
 
-    file << "TITLE = \"2D Euler MMS Solution\"\n";
-    file << "VARIABLES = \"X\" \"Y\" \"rho\" \"u\" \"v\" \"P\" \"Mach\"\n";
-    file << "ZONE I=" << imax+1 << " J=" << jmax+1
-         << ", DATAPACKING=BLOCK\n";
-    file << "VARLOCATION=([3-7]=CELLCENTERED)\n";
+    if (iter == 0) {
+        f << "TITLE = \"2D Euler MMS Solution\"\n";
+        f << "VARIABLES = \"X\" \"Y\" \"rho\" \"u\" \"v\" \"P\" \"Mach\"\n";
+    }
+    f << "ZONE T=\"iter=" << iter << (writeGhosts ? "_ghosts" : "") << "\""
+      << ", STRANDID=1, SOLUTIONTIME=" << iter
+      << ", I=" << I_nodes << " J=" << J_nodes
+      << ", DATAPACKING=BLOCK\n"
+      << "VARLOCATION=([3-7]=CELLCENTERED)\n";
 
-    // Helper to guard against NaNs
-    auto safe = [](double v) {
-        return std::isnan(v) ? -999.9 : v;
-    };
+    // X nodes
+    for (int j=0; j<J_nodes; ++j)
+        for (int i=0; i<I_nodes; ++i)
+            f << safe(writeGhosts ? Xw[i][j] : x_node[i][j]) << "\n";
 
-    // 3. Dump X block (NODAL)
-    for (int j = 0; j <= jmax; ++j)
-      for (int i = 0; i <= imax; ++i)
-        file << x_node[i][j] << "\n";
+    // Y nodes
+    for (int j=0; j<J_nodes; ++j)
+        for (int i=0; i<I_nodes; ++i)
+            f << safe(writeGhosts ? Yw[i][j] : y_node[i][j]) << "\n";
 
+    // Cell-centered: if writing ghosts, dump entire padded V;
+    // otherwise write only physical cells (offset by +g,+g)
+    for (int j=0; j<J_cells; ++j)
+      for (int i=0; i<I_cells; ++i) {
+        const auto &W = writeGhosts ? V[i][j] : V[i+g][j+g];
+        f << safe(W.rho) << "\n";
+      }
 
-    // 4. Dump Y block (NODAL)
-    for (int j = 0; j <= jmax; ++j)
-      for (int i = 0; i <= imax; ++i)
-        file << y_node[i][j] << "\n";
+    for (int j=0; j<J_cells; ++j)
+      for (int i=0; i<I_cells; ++i) {
+        const auto &W = writeGhosts ? V[i][j] : V[i+g][j+g];
+        f << safe(W.u) << "\n";
+      }
 
+    for (int j=0; j<J_cells; ++j)
+      for (int i=0; i<I_cells; ++i) {
+        const auto &W = writeGhosts ? V[i][j] : V[i+g][j+g];
+        f << safe(W.v) << "\n";
+      }
 
-    for (int j = 0; j < jmax; ++j)
-      for (int i = 0; i < imax; ++i)
-        file << V[i+ghost][j+ghost].rho << "\n";
+    for (int j=0; j<J_cells; ++j)
+      for (int i=0; i<I_cells; ++i) {
+        const auto &W = writeGhosts ? V[i][j] : V[i+g][j+g];
+        f << safe(W.P) << "\n";
+      }
 
-    for (int j = 0; j < jmax; ++j)
-      for (int i = 0; i < imax; ++i)
-        file << V[i+ghost][j+ghost].u << "\n";
-
-    for (int j = 0; j < jmax; ++j)
-      for (int i = 0; i < imax; ++i)
-        file << V[i+ghost][j+ghost].v << "\n";
-
-    for (int j = 0; j < jmax; ++j)
-      for (int i = 0; i < imax; ++i)
-        file << V[i+ghost][j+ghost].P << "\n";
-
-    for (int j = 0; j < jmax; ++j)
-      for (int i = 0; i < imax; ++i) {
-        double rho = V[i+ghost][j+ghost].rho;
-        double u = V[i+ghost][j+ghost].u;
-        double v = V[i+ghost][j+ghost].v;
-        double P = V[i+ghost][j+ghost].P;
+    for (int j=0; j<J_cells; ++j)
+      for (int i=0; i<I_cells; ++i) {
+        const auto &W = writeGhosts ? V[i][j] : V[i+g][j+g];
+        double rho = pos(W.rho, RHO_MIN), P = pos(W.P, P_MIN);
         double a = std::sqrt(gamma * P / rho);
-        double mach = std::sqrt(u*u + v*v) / a;
-        file << mach << "\n";
-    }
-    file.close();
-    std::cout << "[INFO] Appended 2D solution for iter=" << iter
-              << " to " << filename << " in BLOCK format\n";
+        double q = std::sqrt(W.u*W.u + W.v*W.v);
+        f << safe(q / (a > 0 ? a : 1e-12)) << "\n";
+      }
+
+    f.close();
+    std::cout << "[INFO] Wrote zone iter=" << iter
+              << (writeGhosts? " (with ghosts)" : " (physical only)") << "\n";
 }
+
+inline double specificInternalEnergy(const Conserved& Uc) {
+    double rho = std::max(Uc.rho, RHO_MIN);
+    double kin = 0.5 * (Uc.rhou*Uc.rhou + Uc.rhov*Uc.rhov) / (rho*rho);
+    return Uc.E / rho - kin; // e (per mass)
+}
+
+struct FieldStats {
+    double minRho, minP, minEint;
+    double maxRho, maxP;
+    size_t nNaN = 0, nInf = 0;
+};
+
+FieldStats check_UV(const char* tag) {
+    FieldStats s{+1e99,+1e99,+1e99,-1e99,-1e99,0,0};
+    for (int i=ghost; i<ghost+imax; ++i)
+      for (int j=ghost; j<ghost+jmax; ++j) {
+        const auto& Uc = U[i][j];
+        const auto& Vc = V[i][j];
+        double e = specificInternalEnergy(Uc);
+        auto upd=[&](double v){ if(!std::isfinite(v)) (std::isinf(v)?++s.nInf:++s.nNaN); };
+        upd(Uc.rho); upd(Uc.rhou); upd(Uc.rhov); upd(Uc.E);
+        upd(Vc.rho); upd(Vc.P);   upd(Vc.u);    upd(Vc.v);
+
+        s.minRho = std::min(s.minRho, Vc.rho);
+        s.maxRho = std::max(s.maxRho, Vc.rho);
+        s.minP   = std::min(s.minP,   Vc.P);
+        s.maxP   = std::max(s.maxP,   Vc.P);
+        s.minEint= std::min(s.minEint,e);
+      }
+    std::cout << "[CHECK] " << tag
+              << "  minRho=" << s.minRho
+              << "  minP="   << s.minP
+              << "  min(e)=" << s.minEint
+              << "  NaN/Inf="<< s.nNaN << "/" << s.nInf << "\n";
+    return s;
+}
+
 
 
 
 int main() {
 
-  int fluxOrder = 2;  // Second-order MUSCL
+  int fluxOrder = 1;  // Second-order MUSCL
   double kappa = 0.5; // Choose limiter parameter (e.g., -1, 0, 0.5, or 1)
-  bool freezeLimiter = true;  // Set to true for pure MUSCL (no limiter)
+  bool freezeLimiter = false;  // Set to true for pure MUSCL (no limiter)
 
     // Create an output folder if needed.
     string outFolder = "OutputFiles";
@@ -1450,44 +1633,47 @@ int main() {
     const std::string meshFile = R"(C:\Users\monicashanmugam\OneDrive - Virginia Tech\Desktop\Virginia Tech\CFD\Projectv2\Project_Files\Project_Files\Grids\curviliniear-grids\curv2d17.grd)";
 
     // 2) Decide whether you want to run in DEBUG (Cartesian) mode
-    bool debugMode = false;  // set true if you want a simple Cartesian mesh  
+    bool debugMode = true;  // set true if you want a simple Cartesian mesh  
     
     double xmin, xmax, ymin, ymax, dx, dy;
+
+    std::vector<std::vector<double>> cellVolume;  // padded volumes (with ghosts)
     
     if (!debugMode) {
-      readCurviMeshFromFile(meshFile,x_cell, y_cell,A_face_i, A_face_j,nx_face_i, ny_face_i,nx_face_j, ny_face_j,xmin, xmax, ymin, ymax,dx, dy);
+     readCurviMeshFromFile(meshFile, x_cell,y_cell,A_face_i,A_face_j,nx_face_i,ny_face_i,nx_face_j,ny_face_j, cellVolume, xmin,xmax,ymin,ymax,dx,dy);
+
 
       std::cout << "[INFO] Loaded curvi mesh with imax = " << imax << ", jmax = " << jmax << "\n";
-    }
-    else {
-      // in debug mode, only read imax/jmax and then overwrite with Cartesian:
-      
-        std::ifstream in(meshFile);
-        if(!in){
-          std::cerr << "Error cannot open mesh file. \n";
-          std::exit(EXIT_FAILURE);
-        }
-        int nz, kmax;
-        in >> nz >> imax >> jmax >> kmax;
-        assert(nz == 1 && kmax == 2);
-    
-      std::tie(xmin, xmax, ymin, ymax, dx, dy) = convertToCartesianDebug(L, x_cell, y_cell, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j);
-      std::cout << "[INFO] Using debug Cartesian mesh: imax="<<imax<<", jmax="<<jmax<<"\n";
+    } else {
+    std::ifstream in(meshFile);
+    if (!in) { std::cerr << "Error: cannot open " << meshFile << "\n"; std::exit(EXIT_FAILURE); }
 
-      // 🟩 Add this to generate nodal coordinates
-      x_node.resize(imax + 1, std::vector<double>(jmax + 1));
-      y_node.resize(imax + 1, std::vector<double>(jmax + 1));
+    int nz, Ni_nodes, Nj_nodes, kplanes;
+    in >> nz >> Ni_nodes >> Nj_nodes >> kplanes;
+    // Treat header numbers as NODES; cells = nodes-1
+    imax = Ni_nodes - 1;
+    jmax = Nj_nodes - 1;
 
-      for (int j = 0; j <= jmax; ++j) {
-        for (int i = 0; i <= imax; ++i) {
-            x_node[i][j] = i * dx;
-            y_node[i][j] = j * dy;
-        }
-      
-      }
+    double Lx = L;  // or set from file/desired size
+    double Ly = L;
 
-    }
+    buildCartesianDebug(
+        imax, jmax, Lx, Ly, ghost,
+        x_cell, y_cell,
+        A_face_i, A_face_j,
+        nx_face_i, ny_face_i,
+        nx_face_j, ny_face_j,
+        cellVolume,
+        x_node, y_node,
+        dx, dy
+    );
 
+    xmin = 0.0; xmax = Lx; ymin = 0.0; ymax = Ly;
+
+    std::cout << "[INFO] Using Cartesian debug: cells="<<imax<<"x"<<jmax
+              << " nodes="<<imax+1<<"x"<<jmax+1
+              << " (ghost="<<ghost<<")\n";
+}
     // ---------------------------------------------------
     // NOW: both branches have set imax/jmax and built the geometry
     int Ni = imax + 2*ghost;
@@ -1503,73 +1689,83 @@ int main() {
               << V.size() << "×" << V[0].size()
               << "\n";
 
-    std::cout << "[INFO] Loaded curvi mesh with imax = " << imax << ", jmax = " << jmax << "\n";
+
+    // After geometry is built and U/V are resized:
     std::cout << "[INFO] Sample values from x_cell and y_cell:\n";
-    for (int i = 0; i < 5; ++i) { // Print first 5 x and y values
-        std::cout << "x_cell[" << i << "] = " << x_cell[i][0] << ", y_cell[" << i << "] = " << y_cell[i][0] << "\n";
+    int Ishow = std::min(5, (int)x_cell.size());
+    int Jshow = std::min(1, (int)(x_cell.empty() ? 0 : x_cell[0].size()));
+    for (int i = 0; i < Ishow; ++i) {
+        std::cout << "x_cell[" << i << "] = " << x_cell[i][0]
+                  << ", y_cell[" << i << "] = " << y_cell[i][0] << "\n";
     }
 
-    // Define the volume array (global or local)
-    std::vector<std::vector<double>> cellVolume(imax + 2 * ghost, std::vector<double>(jmax + 2 * ghost, 0.0));
-
-    // Loop over interior cells and compute area
-    for (int i = ghost; i < imax + ghost; ++i) {
-        for (int j = ghost; j < jmax + ghost; ++j) {
-            cellVolume[i][j] = computeCellArea(i, j, x_cell, y_cell);
-        }
-    }
-
-    // Check computed cell volume
-    std::cout << "[INFO] Sample values from cellVolume array:\n";
-    for (int i = ghost; i < ghost + imax; ++i) {
-        for (int j = ghost; j < ghost + jmax; ++j) {
-            std::cout << "cellVolume[" << i << "][" << j << "] = " << cellVolume[i][j] << "\n";
-        }
-    }
-
+    // Face lengths
     std::cout << "[INFO] Sample values from A_face_i and A_face_j:\n";
-    for (int i = 0; i < 5; ++i) {  // Print first 5 values for A_face_i and A_face_j
-        std::cout << "A_face_i[" << i << "] = " << A_face_i[i][0] << ", A_face_j[" << i << "] = " << A_face_j[i][0] << "\n";
+    int Ishow_i = std::min(5, (int)A_face_i.size());
+    int Ishow_j = std::min(5, (int)A_face_j.size());
+    if (Ishow_i > 0 && !A_face_i[0].empty())
+      for (int i = 0; i < Ishow_i; ++i)
+        std::cout << "A_face_i[" << i << "] = " << A_face_i[i][0] << "\n";
+    if (Ishow_j > 0 && !A_face_j[0].empty())
+      for (int i = 0; i < Ishow_j; ++i)
+        std::cout << "A_face_j[" << i << "] = " << A_face_j[i][0] << "\n";
+
+    // Normals
+    std::cout << "[INFO] Sample values from normal vectors nx/ny:\n";
+    int Nxi = std::min(5, (int)nx_face_i.size());
+    if (Nxi > 0 && !nx_face_i[0].empty()) {
+      for (int i = 0; i < Nxi; ++i) {
+       std::cout << "nx_face_i[" << i << "] = " << nx_face_i[i][0]
+                  << ", ny_face_i[" << i << "] = " << ny_face_i[i][0] << "\n";
+      }
+    }
+    int Nxj = std::min(5, (int)nx_face_j.size());
+    if (Nxj > 0 && !nx_face_j[0].empty()) {
+      for (int i = 0; i < Nxj; ++i) {
+        std::cout << "nx_face_j[" << i << "] = " << nx_face_j[i][0]
+                  << ", ny_face_j[" << i << "] = " << ny_face_j[i][0] << "\n";
+      }
     }
 
-    std::cout << "[INFO] Sample values from normal vectors nx_face_i, ny_face_i, nx_face_j, ny_face_j:\n";
-    for (int i = 0; i < 5; ++i) {  // Print first 5 values for normal vectors
-        std::cout << "nx_face_i[" << i << "] = " << nx_face_i[i][0] << ", ny_face_i[" << i << "] = " << ny_face_i[i][0] << "\n";
-        std::cout << "nx_face_j[" << i << "] = " << nx_face_j[i][0] << ", ny_face_j[" << i << "] = " << ny_face_j[i][0] << "\n";
+    if (!cellVolume.empty() && !cellVolume[0].empty()) {
+      std::cout << "[INFO] Sample values from cellVolume array:\n";
+      int iBeg = ghost, iEnd = std::min(ghost + imax, (int)cellVolume.size());
+      int jBeg = ghost, jEnd = std::min(ghost + jmax, (int)cellVolume[0].size());
+      for (int i = iBeg; i < std::min(iBeg+3, iEnd); ++i)
+        for (int j = jBeg; j < std::min(jBeg+3, jEnd); ++j)
+          std::cout << "cellVolume[" << i << "][" << j << "] = " << cellVolume[i][j] << "\n";
     }
 
-    // 3) Call initializeMMS to fill U/V with the exact primitive → conserved MMS solution:
+    // Call initializeMMS to fill U/V with the exact primitive → conserved MMS solution:
     int mmsCase = 1;
     initializeMMS(mmsCase, L, x_cell, y_cell, U, V);
-    // Now U[i][j] and V[i][j] for i=ghost..ghost+imax−1, j=ghost..ghost+jmax−1 contain the _exact_ MMS solution at each cell‐center.
 
     // Apply the Dirichlet Boundary Conditions
     applyBoundaryConditions(U, V, mmsCase, L, x_cell, y_cell);
 
-    //     // right after initializeMMS + BCs:
-    // OutputSolution2D(solFile, 0);
-
+    check_UV("after init+BC");
 
     std::vector<std::vector<Conserved>> S;
-    computeSourceTermsMMS(mmsCase, gamma, L, x_cell, y_cell, S);
+
+    computeSourceTermsMMS(mmsCase, gamma, L, x_cell, y_cell, cellVolume, S);
 
     GlobalPrimitiveToConserved();
+    OutputSolution2D(solFile, 0);
 
     double dt = computeTimeStep(V, cellVolume, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j);
     std::cout << "[INFO] Computed time step: dt = " << dt << "\n";
-
     
+    std::vector<std::vector<Conserved>> R_int(imax + 2*ghost,std::vector<Conserved>(jmax + 2*ghost));
 
-    std::vector<std::vector<Conserved>> R_int(imax, std::vector<Conserved>(jmax));  // Residuals
 
         // Pseudo-time marching parameters
-    const int maxIter = 1;
-    const int writeInterval = 100;
+    const int maxIter = 200;
+    const int writeInterval = 10;
     double tol = 1e-8;             // convergence tolerance
     ResidualTriple res{1e20,1e20,1e20,1e20};
 
 
-    for (int iter = 0; iter < maxIter; ++iter) {
+    for (int iter = 1; iter < maxIter; ++iter) {
         // 1) compute a stable dt from the current primitive field V
         double dt = computeTimeStep(
             V, cellVolume,
@@ -1585,9 +1781,15 @@ int main() {
             S,              // your MMS source term
             R_int,          // scratch for convective residual
             dt,
-            xmin, xmax, ymin, ymax,
+            cellVolume,
             debugMode, dx, dy
         );
+
+        std::vector<std::vector<Conserved>> R_now;
+        computeResidualMMS(fluxOrder, kappa, freezeLimiter, x_cell, y_cell, V, S, R_now);
+        res = computeResidualNorms(R_now);
+        std::cout << "iter=" << iter << "  ||R+S|| (final state) = " << res.combined << "\n";
+
 
         // 3) every writeInterval steps, dump to Tecplot and print residual
         if ((iter % writeInterval) == 0) {
