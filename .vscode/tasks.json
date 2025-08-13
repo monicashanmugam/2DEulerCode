@@ -2,16 +2,18 @@
     "version": "2.0.0",
     "tasks": [
         {
-            "label": "build-all",
+            "label": "Build (g++)",
             "type": "shell",
             "command": "C:/msys64/ucrt64/bin/g++.exe",
             "args": [
                 "-std=c++17",
                 "-g",
                 "-O0",
+                "-Wall",
+                "-Wextra",
                 "2DEulerCode.cpp",
                 "-o",
-                "2DEulerCode.exe"
+                "${workspaceFolder}/2DEulerCode.exe"
             ],
             "options": {
                 "cwd": "${workspaceFolder}"
@@ -23,8 +25,8 @@
         },
         {
             "type": "cppbuild",
-            "label": "C/C++: gcc.exe build active file",
-            "command": "C:\\msys64\\ucrt64\\bin\\gcc.exe",
+            "label": "C/C++: g++.exe build active file",
+            "command": "C:\\msys64\\ucrt64\\bin\\g++.exe",
             "args": [
                 "-fdiagnostics-color=always",
                 "-g",

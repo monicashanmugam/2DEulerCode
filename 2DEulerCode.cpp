@@ -30,6 +30,9 @@ const double delta = 1e-6; // For computing the r
 std::vector<std::vector<double>> x_node;
 std::vector<std::vector<double>> y_node;
 
+static_assert(ghost >= 2, "MUSCL reconstruction needs at least 2 ghost cells.");
+
+
 
 //-----------------------------------------------------
 // Primitive and Conserved definitions
@@ -484,18 +487,6 @@ void readCurviMeshFromFile(
     // --- save nodal arrays for Tecplot (no ghosts) ---
     x_node = Xn;  y_node = Yn;
 
-    xmin = xmax = Xn[0][0];
-    ymin = ymax = Yn[0][0];
-    for (int j = 0; j < Nj_nodes; ++j)
-      for (int i = 0; i < Ni_nodes; ++i) {
-        xmin = std::min(xmin, Xn[i][j]);
-        xmax = std::max(xmax, Xn[i][j]);
-        ymin = std::min(ymin, Yn[i][j]);
-        ymax = std::max(ymax, Yn[i][j]);
-      }
-    dx = (xmax - xmin) / double(imax);
-    dy = (ymax - ymin) / double(jmax);
-
     // --- centers (interior imax x jmax) ---
     x_cell.assign(imax, std::vector<double>(jmax));
     y_cell.assign(imax, std::vector<double>(jmax));
@@ -747,11 +738,7 @@ inline double press_mms(int mmsCase, double L, double x, double y) {
 //   but replacing every “rho0, rhox, …” with C.<name> based on mmsCase.
 //----------------------------------------------------------------------
 
-inline double rmassconv(int mmsCase,
-                        double L,
-                        double x,
-                        double y)
-{
+inline double rmassconv(int mmsCase, double L, double x, double y) {
     assert(mmsCase==1 || mmsCase==2);
     const auto& C = (mmsCase==1 ? mmsSup : mmsSub);
 
@@ -919,12 +906,7 @@ inline double ymtmconv(int mmsCase, double L, double x, double y) {
          - term6;
 }
 
-inline double energyconv(int mmsCase,
-                         double gamma,
-                         double L,
-                         double x,
-                         double y)
-{
+inline double energyconv(int mmsCase, double gamma, double L, double x, double y){
     assert(mmsCase == 1 || mmsCase == 2);
     const auto& C = (mmsCase == 1 ? mmsSup : mmsSub);
 
@@ -1008,41 +990,38 @@ inline double energyconv(int mmsCase,
     return term1 + term2 + term3 + term4 + term5 + term6;
 }
 
-
 //Initialize the cells with the exact solution from MMS
 
-void initializeMMS(int mmsCase, double L,
-                   const std::vector<std::vector<double>>& x_cell,
-                   const std::vector<std::vector<double>>& y_cell,
-                   std::vector<std::vector<Conserved>>& U,
-                   std::vector<std::vector<Primitive>>& V) {
-    
-    int Ni = imax + 2 * ghost;
-    int Nj = jmax + 2 * ghost;
+void initializeMMS(
+    int mmsCase, double L,
+    const std::vector<std::vector<double>>& x_cell,
+    const std::vector<std::vector<double>>& y_cell
+) {
+    const int Ni = imax + 2*ghost;
+    const int Nj = jmax + 2*ghost;
 
-    // Resize primitive array
-    V.assign(Ni, std::vector<Primitive>(Nj));
+    // Ensure V is sized (if not already sized before this call)
+    if ((int)V.size() != Ni || (int)V[0].size() != Nj) {
+        V.assign(Ni, std::vector<Primitive>(Nj));
+    }
 
-    // Step 1: Fill Primitive Variables
-    for (int i = 0; i < Ni; ++i) {
-        for (int j = 0; j < Nj; ++j) {
+    // Fill ONLY physical cells: i∈[ghost .. ghost+imax-1], j∈[ghost .. ghost+jmax-1]
+    for (int i = ghost; i < ghost + imax; ++i) {
+        for (int j = ghost; j < ghost + jmax; ++j) {
             double x = x_cell[i][j];
             double y = y_cell[i][j];
 
-            Primitive Vcell;
-            Vcell.rho = rho_mms(mmsCase, L, x, y);
-            Vcell.u   = uvel_mms(mmsCase, L, x, y);
-            Vcell.v   = vvel_mms(mmsCase, L, x, y);
-            Vcell.P   = press_mms(mmsCase, L, x, y);
-            V[i][j] = Vcell;
+            V[i][j].rho = rho_mms(mmsCase, L, x, y);
+            V[i][j].u   = uvel_mms(mmsCase, L, x, y);
+            V[i][j].v   = vvel_mms(mmsCase, L, x, y);
+            V[i][j].P   = press_mms(mmsCase, L, x, y);
         }
     }
 
-    // Step 2: Use your pre-defined function to convert to Conserved
-    GlobalPrimitiveToConserved();
-
-    std::cout << "[INFO] Initialized MMS primitive + conserved.\n";
+    // DO NOT convert here; ghosts are not set yet.
+    // (No GlobalPrimitiveToConserved() call in initializeMMS.)
 }
+
 
 //----------------------------------------------------------------------
 // (E) computeSourceTermsMMS(…)
@@ -1080,10 +1059,9 @@ void computeSourceTermsMMS(
 
 
 void applyBoundaryConditions(
-    std::vector<std::vector<Conserved>> &U,
+    std::vector<std::vector<Conserved>> &U,   // (can be unused if you prefer)
     std::vector<std::vector<Primitive>> &V,
-    int mmsCase,
-    double L,
+    int mmsCase, double L,
     const std::vector<std::vector<double>> &x_cell,
     const std::vector<std::vector<double>> &y_cell
 ) {
@@ -1092,27 +1070,20 @@ void applyBoundaryConditions(
 
     for (int i = 0; i < ni; ++i) {
         for (int j = 0; j < nj; ++j) {
+            // only ghosts
             if (i >= ghost && i < ghost + imax && j >= ghost && j < ghost + jmax) continue;
 
-            // Calculate boundary x and y positions
             double x = x_cell[i][j];
             double y = y_cell[i][j];
 
-            // Initialize the Primitive and Conserved variables
-            Primitive Vcell;
-            Vcell.rho = rho_mms(mmsCase, L, x, y);
-            Vcell.u   = uvel_mms(mmsCase, L, x, y);
-            Vcell.v   = vvel_mms(mmsCase, L, x, y);
-            Vcell.P   = press_mms(mmsCase, L, x, y);
-
-            Conserved Ucell = PrimitiveToConserved(Vcell);
-
-            // Update boundary cells (ghost cells)
-            V[i][j] = Vcell;
-            U[i][j] = Ucell;
+            V[i][j].rho = rho_mms(mmsCase, L, x, y);
+            V[i][j].u   = uvel_mms(mmsCase, L, x, y);
+            V[i][j].v   = vvel_mms(mmsCase, L, x, y);
+            V[i][j].P   = press_mms(mmsCase, L, x, y);
         }
     }
 }
+
 
 
 double computeTimeStep(
@@ -1327,19 +1298,20 @@ inline void musclJ(
   rec([](auto&p){return p.v;  }, &Primitive::v);
   rec([](auto&p){return p.P;  }, &Primitive::P);
 }
-//———————————————————————————————————————————————————————————————————
 //------------------------------------------------------------------------------
 // computeResidualMMS
 //
-// Computes the purely convective residual R[i][j] = ∑faces (±F_face), using
-// 2nd-order MUSCL + van Leer flux splitting.  You then add the analytic source
-// S[i][j] in your time‐loop so that R+S → 0 for the exact MMS solution.
+// Builds the residual over each control volume as:
+//     R[i][j] = (∑face convective fluxes)  −  S[i][j]
+// where S is the *volume-integrated* MMS source, so that the exact MMS solution
+// satisfies R = 0.
 //
 // fluxOrder     : 1 or 2
 // kappa         : limiter parameter (e.g. −1, 0, 0.5, 1)
 // freezeLimiter : if true, bypasses the limiter (→ pure MUSCL without TVD lim)
-// x_cell, y_cell: cell‐center coordinates
+// x_cell, y_cell: cell-center coordinates (not used here but kept for parity)
 // V             : primitive array (rho,u,v,P) including ghosts
+// S             : volume-integrated source terms (same indexing as V)
 // R             : output residual, same size as V
 //------------------------------------------------------------------------------
 void computeResidualMMS(
@@ -1349,51 +1321,48 @@ void computeResidualMMS(
     const std::vector<std::vector<double>>& x_cell,
     const std::vector<std::vector<double>>& y_cell,
     const std::vector<std::vector<Primitive>>& V,
-    const std::vector<std::vector<Conserved>>& S,  // ← add this
-    std::vector<std::vector<Conserved>>&   R
+    const std::vector<std::vector<Conserved>>& S,
+    std::vector<std::vector<Conserved>>& R
 )
- {  
-  int Ni = imax + 2*ghost;
-  int Nj = jmax + 2*ghost;
+{
+    int Ni = imax + 2*ghost;
+    int Nj = jmax + 2*ghost;
 
-  R.assign(Ni, vector<Conserved>(Nj, {0,0,0,0}));
+    R.assign(Ni, std::vector<Conserved>(Nj, {0,0,0,0}));
 
-  // —— vertical (i‐faces) ——
-// only go as far as i+2 < Ni  ⇒  i ≤ Ni-3  ⇒  i ≤ (ghost+imax-1)
-  for(int i = ghost; i <= ghost+imax-1; ++i){
-    for(int j = ghost; j < ghost+jmax; ++j){
-      Primitive PL, PR;
-      musclI(V, i, j, fluxOrder, kappa, freezeLimiter, PL, PR);
-      auto F = faceFluxVL2D(PL, PR, nx_face_i[i][j], ny_face_i[i][j], A_face_i[i][j]);
-       R[i  ][j] += F;
-       R[i+1][j] -= F;
+    // Vertical i-faces: include left physical boundary (i = ghost-1)
+    for (int i = ghost-1; i <= ghost + imax - 1; ++i) {
+        for (int j = ghost; j < ghost + jmax; ++j) {
+            Primitive PL, PR;
+            musclI(V, i, j, fluxOrder, kappa, freezeLimiter, PL, PR);
+            auto F = faceFluxVL2D(PL, PR, nx_face_i[i][j], ny_face_i[i][j], A_face_i[i][j]);
+            R[i  ][j] += F;  // left cell
+            R[i+1][j] -= F;  // right cell
+        }
     }
-  }
 
-  // —— horizontal (j‐faces) ——
-// only go as far as j+2 < Nj  ⇒  j ≤ Nj-3  ⇒  j ≤ (ghost+jmax-1)
-  for(int i = ghost; i < ghost+imax; ++i){
-    for(int j = ghost; j <= ghost+jmax-1; ++j){
-      Primitive PL, PR;
-      musclJ(V, i, j, fluxOrder, kappa, freezeLimiter, PL, PR);
-      auto G = faceFluxVL2D(PL, PR, nx_face_j[i][j], ny_face_j[i][j], A_face_j[i][j]);
-      R[i][j] += G;
-      R[i][j+1] -= G;
+    // Horizontal j-faces: include bottom physical boundary (j = ghost-1)
+    for (int i = ghost; i < ghost + imax; ++i) {
+        for (int j = ghost-1; j <= ghost + jmax - 1; ++j) {
+            Primitive PL, PR;
+            musclJ(V, i, j, fluxOrder, kappa, freezeLimiter, PL, PR);
+            auto G = faceFluxVL2D(PL, PR, nx_face_j[i][j], ny_face_j[i][j], A_face_j[i][j]);
+            R[i][j  ] += G;  // bottom cell
+            R[i][j+1] -= G;  // top cell
+        }
     }
-  }
 
-    // — now include the MMS source —
-  for (int i = ghost; i < ghost+imax; ++i) {
-    for (int j = ghost; j < ghost+jmax; ++j) {
-      R[i][j].rho  -= S[i][j].rho;
-      R[i][j].rhou -= S[i][j].rhou;
-      R[i][j].rhov -= S[i][j].rhov;
-      R[i][j].E    -= S[i][j].E;
+    // Subtract the MMS source (volume-integrated) on interior cells
+    for (int i = ghost; i < ghost + imax; ++i) {
+        for (int j = ghost; j < ghost + jmax; ++j) {
+            R[i][j].rho  -= S[i][j].rho;
+            R[i][j].rhou -= S[i][j].rhou;
+            R[i][j].rhov -= S[i][j].rhov;
+            R[i][j].E    -= S[i][j].E;
+        }
     }
-  }
 }
 
-// replace your rungeKutta2Step(...) body with this
 void rungeKutta2Step(
     int fluxOrder, double kappa, bool freezeLimiter,
     int mmsCase, double L,
@@ -1406,78 +1375,121 @@ void rungeKutta2Step(
     const int i0 = ghost, i1 = ghost + imax - 1;
     const int j0 = ghost, j1 = ghost + jmax - 1;
 
-    // Stage 1 @ V^n
+    // Ensure ghosts are consistent at the start of the step
+    applyBoundaryConditions(U, V, mmsCase, L, x_cell, y_cell);
+
+    // ===== Stage 1 @ V^n =====
     computeResidualMMS(fluxOrder, kappa, freezeLimiter, x_cell, y_cell, V, S, R_int);
-    auto R1 = R_int;                      // store
-    auto U0 = U;                          // keep original
+    const auto& R1 = R_int;
+
+    auto U0     = U;
     auto U_star = U0;
 
     for (int i = i0; i <= i1; ++i)
-      for (int j = j0; j <= j1; ++j) {
-        double vol = cellVolume[i][j];
-        U_star[i][j].rho  = U0[i][j].rho  - (dt/vol)*R1[i][j].rho;
-        U_star[i][j].rhou = U0[i][j].rhou - (dt/vol)*R1[i][j].rhou;
-        U_star[i][j].rhov = U0[i][j].rhov - (dt/vol)*R1[i][j].rhov;
-        U_star[i][j].E    = U0[i][j].E    - (dt/vol)*R1[i][j].E;
-      }
-    applyBoundaryConditions(U_star, V, mmsCase, L, x_cell, y_cell);
+        for (int j = j0; j <= j1; ++j) {
+            double vol = cellVolume[i][j];
+            U_star[i][j].rho  = U0[i][j].rho  - (dt/vol) * R1[i][j].rho;
+            U_star[i][j].rhou = U0[i][j].rhou - (dt/vol) * R1[i][j].rhou;
+            U_star[i][j].rhov = U0[i][j].rhov - (dt/vol) * R1[i][j].rhov;
+            U_star[i][j].E    = U0[i][j].E    - (dt/vol) * R1[i][j].E;
+        }
 
-    // V* from U*
+    // Apply BCs to U* ghosts (if your BCs write U)
+    applyBoundaryConditions(U_star, V /*unused here*/, mmsCase, L, x_cell, y_cell);
+
+    // Build V* from U*
     std::vector<std::vector<Primitive>> V_star(U_star.size(),
                                                std::vector<Primitive>(U_star[0].size()));
     for (int i = 0; i < (int)U_star.size(); ++i)
-      for (int j = 0; j < (int)U_star[0].size(); ++j)
-        V_star[i][j] = ConservedToPrimitiveCell(U_star[i][j]);
+        for (int j = 0; j < (int)U_star[0].size(); ++j)
+            V_star[i][j] = ConservedToPrimitiveCell(U_star[i][j]);
 
+    // 🔧 Critical: apply BCs to V* ghosts as well (Dirichlet primitives for MMS)
+    applyBoundaryConditions(U_star /*ignored*/, V_star, mmsCase, L, x_cell, y_cell);
 
-    // Stage 2 @ V*
+    // ===== Stage 2 @ V* =====
     computeResidualMMS(fluxOrder, kappa, freezeLimiter, x_cell, y_cell, V_star, S, R_int);
-    auto R2 = R_int;
+    const auto& R2 = R_int;
 
-    // Heun average back to U^{n+1}
+    // Heun average → U^{n+1}
     for (int i = i0; i <= i1; ++i)
-      for (int j = j0; j <= j1; ++j) {
-        double vol = cellVolume[i][j];
-        U[i][j].rho  = U0[i][j].rho  - 0.5*(dt/vol)*(R1[i][j].rho  + R2[i][j].rho);
-        U[i][j].rhou = U0[i][j].rhou - 0.5*(dt/vol)*(R1[i][j].rhou + R2[i][j].rhou);
-        U[i][j].rhov = U0[i][j].rhov - 0.5*(dt/vol)*(R1[i][j].rhov + R2[i][j].rhov);
-        U[i][j].E    = U0[i][j].E    - 0.5*(dt/vol)*(R1[i][j].E    + R2[i][j].E);
-      }
+        for (int j = j0; j <= j1; ++j) {
+            double vol = cellVolume[i][j];
+            U[i][j].rho  = U0[i][j].rho  - 0.5*(dt/vol) * (R1[i][j].rho  + R2[i][j].rho);
+            U[i][j].rhou = U0[i][j].rhou - 0.5*(dt/vol) * (R1[i][j].rhou + R2[i][j].rhou);
+            U[i][j].rhov = U0[i][j].rhov - 0.5*(dt/vol) * (R1[i][j].rhov + R2[i][j].rhov);
+            U[i][j].E    = U0[i][j].E    - 0.5*(dt/vol) * (R1[i][j].E    + R2[i][j].E);
+        }
 
+    // Sync primitives from updated U and re-apply BCs for ghosts
+    GlobalConservedToPrimitive();                   // V ← U (interior+ghosts)
     applyBoundaryConditions(U, V, mmsCase, L, x_cell, y_cell);
-    GlobalConservedToPrimitive();
-
 }
 
 
-// Define the ResidualTriple structure
-struct ResidualTriple {
-    double mass;      // Mass residual
-    double mom;       // Momentum residual (combined for x and y directions)
-    double eng;       // Energy residual
-    double combined;  // Combined residual (max of all three norms)
+
+
+
+struct Residual4 {
+    double cont;    // continuity (rho)
+    double momx;    // x-momentum (rhou)
+    double momy;    // y-momentum (rhov)
+    double energy;  // total energy (E)
+    double combined; // optional: sqrt(cont^2 + momx^2 + momy^2 + energy^2)
 };
 
-
-ResidualTriple computeResidualNorms(
-    const std::vector<std::vector<Conserved>>& R
-) {
-    double sumM=0, sumMx=0, sumMy=0, sumE=0;
-    for (int i = ghost; i < ghost+imax; ++i)
-        for (int j = ghost; j < ghost+jmax; ++j) {
-            sumM  += R[i][j].rho  * R[i][j].rho;
-            sumMx += R[i][j].rhou * R[i][j].rhou;
-            sumMy += R[i][j].rhov * R[i][j].rhov;
-            sumE  += R[i][j].E    * R[i][j].E;
-        }
-    double n = double(imax*jmax);
-    ResidualTriple r;
-    r.mass     = std::sqrt(sumM  / n);
-    r.mom      = std::sqrt((sumMx+sumMy) / n);
-    r.eng      = std::sqrt(sumE  / n);
-    r.combined = std::max({r.mass, r.mom, r.eng});
-    return r;
+// L2 over *interior* cells only
+inline Residual4 computeResidualL2_4(const std::vector<std::vector<Conserved>>& R)
+{
+    double s_rho=0, s_rhou=0, s_rhov=0, s_E=0;
+    for (int i = ghost; i < ghost + imax; ++i)
+      for (int j = ghost; j < ghost + jmax; ++j) {
+        const auto& q = R[i][j];
+        s_rho  += q.rho  * q.rho;
+        s_rhou += q.rhou * q.rhou;
+        s_rhov += q.rhov * q.rhov;
+        s_E    += q.E    * q.E;
+      }
+    Residual4 out;
+    out.cont   = std::sqrt(s_rho);
+    out.momx   = std::sqrt(s_rhou);
+    out.momy   = std::sqrt(s_rhov);
+    out.energy = std::sqrt(s_E);
+    out.combined = std::sqrt(out.cont*out.cont + out.momx*out.momx
+                           + out.momy*out.momy + out.energy*out.energy);
+    return out;
 }
+
+// Volume-normalize a residual field (R/Vol) cell-wise
+inline std::vector<std::vector<Conserved>>
+volumeNormalize(const std::vector<std::vector<Conserved>>& Rin,
+                const std::vector<std::vector<double>>& cellVolume)
+{
+    auto Q = Rin;
+    for (int i = ghost; i < ghost + imax; ++i)
+      for (int j = ghost; j < ghost + jmax; ++j) {
+        double vol = cellVolume[i][j];
+        Q[i][j].rho  /= vol;
+        Q[i][j].rhou /= vol;
+        Q[i][j].rhov /= vol;
+        Q[i][j].E    /= vol;
+      }
+    return Q;
+}
+
+// Safe component-wise normalization current/base
+inline Residual4 normalizeResidual4(const Residual4& cur, const Residual4& base)
+{
+    auto nd = [](double a, double b){ return a / std::max(b, 1e-300); };
+    return {
+        nd(cur.cont,   base.cont),
+        nd(cur.momx,   base.momx),
+        nd(cur.momy,   base.momy),
+        nd(cur.energy, base.energy),
+        nd(cur.combined, base.combined)
+    };
+}
+
 
 //------------------------------------------------------------------------------
 // 2D Tecplot dump: writes one POINT‐format zone per call.
@@ -1606,12 +1618,63 @@ FieldStats check_UV(const char* tag) {
     return s;
 }
 
+static void checkGhostsAgainstMMS(
+    const std::vector<std::vector<Primitive>>& V,
+    int mmsCase, double L,
+    const std::vector<std::vector<double>>& x_cell,
+    const std::vector<std::vector<double>>& y_cell,
+    const char* where
+){
+    const int g = ghost;
+    auto check = [&](int i, int j, double &eR, double &eU, double &eV, double &eP){
+        double x = x_cell[i][j], y = y_cell[i][j];
+        Primitive exact{
+            rho_mms(mmsCase,L,x,y),
+            uvel_mms(mmsCase,L,x,y),
+            vvel_mms(mmsCase,L,x,y),
+            press_mms(mmsCase,L,x,y)
+        };
+        eR = std::max(eR, std::abs(V[i][j].rho - exact.rho));
+        eU = std::max(eU, std::abs(V[i][j].u   - exact.u));
+        eV = std::max(eV, std::abs(V[i][j].v   - exact.v));
+        eP = std::max(eP, std::abs(V[i][j].P   - exact.P));
+    };
+
+    double eR=0,eU=0,eV=0,eP=0;
+
+    // left/right ghost belts
+    for(int q=1; q<=g; ++q){
+        int iL = g - q;
+        int iR = g + imax - 1 + q;
+        for(int j=g; j<g+jmax; ++j){
+            check(iL,j,eR,eU,eV,eP);
+            check(iR,j,eR,eU,eV,eP);
+        }
+    }
+    // bottom/top ghost belts
+    for(int q=1; q<=g; ++q){
+        int jB = g - q;
+        int jT = g + jmax - 1 + q;
+        for(int i=g; i<g+imax; ++i){
+            check(i,jB,eR,eU,eV,eP);
+            check(i,jT,eR,eU,eV,eP);
+        }
+    }
+
+    std::cerr << "[BCCHK] " << where
+              << "  max|ρ|=" << eR
+              << "  |u|="   << eU
+              << "  |v|="   << eV
+              << "  |P|="   << eP << "\n";
+}
+
+
 
 
 
 int main() {
 
-  int fluxOrder = 1;  // Second-order MUSCL
+  int fluxOrder = 2;  // Second-order MUSCL
   double kappa = 0.5; // Choose limiter parameter (e.g., -1, 0, 0.5, or 1)
   bool freezeLimiter = false;  // Set to true for pure MUSCL (no limiter)
 
@@ -1738,10 +1801,12 @@ int main() {
 
     // Call initializeMMS to fill U/V with the exact primitive → conserved MMS solution:
     int mmsCase = 1;
-    initializeMMS(mmsCase, L, x_cell, y_cell, U, V);
+    initializeMMS(mmsCase, L, x_cell, y_cell);
 
     // Apply the Dirichlet Boundary Conditions
     applyBoundaryConditions(U, V, mmsCase, L, x_cell, y_cell);
+
+    GlobalPrimitiveToConserved();
 
     check_UV("after init+BC");
 
@@ -1750,29 +1815,30 @@ int main() {
     computeSourceTermsMMS(mmsCase, gamma, L, x_cell, y_cell, cellVolume, S);
 
     GlobalPrimitiveToConserved();
+
     OutputSolution2D(solFile, 0);
 
     std::vector<std::vector<Conserved>> R0;
     computeResidualMMS(fluxOrder, kappa, freezeLimiter, x_cell, y_cell, V, S, R0);
 
-    // helper to volume-normalize a residual field
-    auto volNorm = [&](const std::vector<std::vector<Conserved>>& Rin){
-        auto Q = Rin;
-        for (int i = ghost; i < ghost + imax; ++i)
-          for (int j = ghost; j < ghost + jmax; ++j) {
-            double vol = cellVolume[i][j];
-            Q[i][j].rho  /= vol;
-            Q[i][j].rhou /= vol;
-            Q[i][j].rhov /= vol;
-            Q[i][j].E    /= vol;
-          }
-        return Q;
-    };
+    // Baselines (raw and per-volume) for each equation
+    Residual4 base_raw4 = computeResidualL2_4(R0);
+    Residual4 base_vol4 = computeResidualL2_4(volumeNormalize(R0, cellVolume));
 
-    ResidualTriple base_raw = computeResidualNorms(R0);
-    ResidualTriple base_vol = computeResidualNorms(volNorm(R0));
+    std::cout << "[INIT] L2 residuals (raw): "
+              << "cont="   << base_raw4.cont
+              << " momx="  << base_raw4.momx
+              << " momy="  << base_raw4.momy
+              << " energy="<< base_raw4.energy
+              << " | combined=" << base_raw4.combined << "\n";
 
-    std::cout << "[INIT] L2 residual  raw=" << base_raw.combined << "  perVol=" << base_vol.combined << "\n";
+    std::cout << "[INIT] L2 residuals (perVol): "
+              << "cont="   << base_vol4.cont
+              << " momx="  << base_vol4.momx
+              << " momy="  << base_vol4.momy
+              << " energy="<< base_vol4.energy
+              << " | combined=" << base_vol4.combined << "\n";
+
 
     double dt = computeTimeStep(V, cellVolume, A_face_i, A_face_j, nx_face_i, ny_face_i, nx_face_j, ny_face_j);
     std::cout << "[INFO] Computed time step: dt = " << dt << "\n";
@@ -1781,65 +1847,71 @@ int main() {
 
 
         // Pseudo-time marching parameters
-    const int maxIter = 200;
-    const int writeInterval = 10;
+    const int maxIter = 1000;
+    const int writeInterval = 200;
     double tol = 1e-8;             // convergence tolerance
-    ResidualTriple res{1e20,1e20,1e20,1e20};
+ 
 
 
+    
     for (int iter = 1; iter < maxIter; ++iter) {
-        // 1) compute a stable dt from the current primitive field V
+    // 1) CFL time step from current V
         double dt = computeTimeStep(
             V, cellVolume,
-            A_face_i,   A_face_j,
-            nx_face_i,  ny_face_i,
-            nx_face_j,  ny_face_j
+            A_face_i, A_face_j,
+            nx_face_i, ny_face_i, nx_face_j, ny_face_j
         );
 
-        // 2) advance U/V by one two-stage RK step
+    // 2) Advance one RK2 step (updates U and V via your function)
         rungeKutta2Step(
             fluxOrder, kappa, freezeLimiter,
             mmsCase, L,
-            S,              // your MMS source term
-            R_int,          // scratch for convective residual
+            S,              // MMS source
+            R_int,          // scratch
             dt,
             cellVolume,
             debugMode, dx, dy
         );
 
+        // 3) Residual at updated state
         std::vector<std::vector<Conserved>> R_now;
         computeResidualMMS(fluxOrder, kappa, freezeLimiter, x_cell, y_cell, V, S, R_now);
-        auto cur_raw = computeResidualNorms(R_now);
-        auto cur_vol = computeResidualNorms(volNorm(R_now));
 
-        // safe normalization
-        auto nd = [](double a, double b){ return a / std::max(b, 1e-300); };
+        // 4) Current L2 norms (raw and per-volume)
+        Residual4 cur_raw4 = computeResidualL2_4(R_now);
+        Residual4 cur_vol4 = computeResidualL2_4(volumeNormalize(R_now, cellVolume));
 
+        // 5) Normalize component-wise against the *initial* baselines
+        Residual4 nraw = normalizeResidual4(cur_raw4, base_raw4);
+        Residual4 nvol = normalizeResidual4(cur_vol4, base_vol4);
+
+        // 6) Print ONLY normalized values (use per-volume as your main metric)
         std::cout << "iter=" << iter
-          << "  L2 residual: raw=" << cur_raw.combined
-          << " (norm=" << nd(cur_raw.combined, base_raw.combined) << ")"
-          << "  perVol=" << cur_vol.combined
-          << " (norm=" << nd(cur_vol.combined, base_vol.combined) << ")\n";
+                  << "  norm(perVol): "
+                  << "cont="   << nvol.cont
+                  << " momx="  << nvol.momx
+                  << " momy="  << nvol.momy
+                  << " energy="<< nvol.energy
+                  << " | max=" << std::max(std::max(nvol.cont, nvol.momx),
+                                       std::max(nvol.momy, nvol.energy))
+                  << "\n";
 
+        // 7) Convergence check on the worst component (safer than combined)
+        double conv_metric = std::max(std::max(nvol.cont, nvol.momx),
+                                      std::max(nvol.momy, nvol.energy));
+        if (conv_metric < tol) {
+            std::cout << "Converged at iter=" << iter
+                      << " (max normalized per-volume residual=" << conv_metric << ")\n";
+            OutputSolution2D(solFile, iter); // final write
+            break;
+        }
 
-        // 3) every writeInterval steps, dump to Tecplot and print residual
+        // 8) Optional: write solution every writeInterval
         if ((iter % writeInterval) == 0) {
-            // compute/update your residual‐norms
-            res = computeResidualNorms(R_int);
-            std::cout << "iter=" << iter
-                      << "  combined residual=" << res.combined
-                      << "\n";
-
-            // append a new zone at time=iter*dt
             OutputSolution2D(solFile, iter);
         }
 
-        // 4) optional early exit if converged
-        if (res.combined < tol) {
-            std::cout << "Converged in " << iter << " steps.\n";
-            break;
-        }
     }
 
-    return 0;
+    return 0; 
 }
