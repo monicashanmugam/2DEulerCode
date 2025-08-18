@@ -1245,59 +1245,95 @@ inline Conserved faceFluxVL2D(
   return FcL + FpL + FcR + FpR;
 }
 
-// MUSCL in i-direction at face i+1/2, j fixed:
-inline void musclI(
-  const std::vector<std::vector<Primitive>> &V,
-  int i, int j,
-  int order, double kappa, bool freeze,
-  Primitive &L, Primitive &R
-) {
-  double eps = (order==2 ? 1.0 : 0.0);
-  double d0 = V[i+1][j].rho - V[i][j].rho;
-  double rP = (V[i+2][j].rho - V[i+1][j].rho)/safeDenom(d0);
-  double rM = (V[i][j].rho   - V[i-1][j].rho)/safeDenom(d0);
-  double xiP = freeze?1.0:xi_limiter(rP);
-  double xiM = freeze?1.0:xi_limiter(rM);
-  auto rec = [&](auto get, auto set) {
-    double LL = get(V[i-1][j]);
-    double CC = get(V[i  ][j]);
-    double RR = get(V[i+1][j]);
-    double RR2= get(V[i+2][j]);
-    L.*set = CC + (eps/4.0)*((1-kappa)*xiP*(CC-LL) + (1+kappa)*xiM*(RR-CC));
-    R.*set = RR - (eps/4.0)*((1-kappa)*xiM*(RR2-RR) + (1+kappa)*xiP*(RR-CC));
-  };
-  rec([](auto&p){return p.rho;}, &Primitive::rho);
-  rec([](auto&p){return p.u;  }, &Primitive::u);
-  rec([](auto&p){return p.v;  }, &Primitive::v);
-  rec([](auto&p){return p.P;  }, &Primitive::P);
+inline double xi_vanleer(double r){
+    return (r + std::fabs(r)) / std::max(1e-12, 1.0 + r);
+}
+inline double rratio(double up, double um, double small=1e-12){
+    double d = up - um; // central jump
+    return (std::fabs(d) < small) ? 0.0 : (up - um) / d; // you’ll pass proper args below
 }
 
-// MUSCL in j-direction at face j+1/2, i fixed:
-inline void musclJ(
-  const std::vector<std::vector<Primitive>> &V,
-  int i, int j,
-  int order, double kappa, bool freeze,
-  Primitive &L, Primitive &R
-) {
-  double eps = (order==2 ? 1.0 : 0.0);
-  double d0 = V[i][j+1].rho - V[i][j].rho;
-  double rP = (V[i][j+2].rho - V[i][j+1].rho)/safeDenom(d0);
-  double rM = (V[i][j].rho   - V[i][j-1].rho)/safeDenom(d0);
-  double xiP = freeze?1.0:xi_limiter(rP);
-  double xiM = freeze?1.0:xi_limiter(rM);
-  auto rec = [&](auto get, auto set) {
-    double LL = get(V[i][j-1]);
-    double CC = get(V[i][j  ]);
-    double RR = get(V[i][j+1]);
-    double RR2= get(V[i][j+2]);
-    L.*set = CC + (eps/4.0)*((1-kappa)*xiP*(CC-LL) + (1+kappa)*xiM*(RR-CC));
-    R.*set = RR - (eps/4.0)*((1-kappa)*xiM*(RR2-RR) + (1+kappa)*xiP*(RR-CC));
-  };
-  rec([](auto&p){return p.rho;}, &Primitive::rho);
-  rec([](auto&p){return p.u;  }, &Primitive::u);
-  rec([](auto&p){return p.v;  }, &Primitive::v);
-  rec([](auto&p){return p.P;  }, &Primitive::P);
+template<class T> inline void clampPrim(T& W){
+    W.rho = std::max(W.rho, RHO_MIN);
+    W.P   = std::max(W.P,   P_MIN);
+    W.u   = std::clamp(W.u, U_MIN, U_MAX);
+    W.v   = std::clamp(W.v, V_MIN, V_MAX);
 }
+
+inline void musclI(const std::vector<std::vector<Primitive>>& V, int i,int j,
+                   int order,double kappa,bool freeze, Primitive& L, Primitive& R)
+{
+    const double eps = (order==2 ? 1.0 : 0.0);
+
+    auto rec = [&](auto get, auto set){
+        const double LL = get(V[i-1][j]);
+        const double C  = get(V[i  ][j]);
+        const double R1 = get(V[i+1][j]);
+        const double R2 = get(V[i+2][j]);
+
+        const double dC = R1 - C;
+        const double dL = C  - LL;
+        const double dR = R2 - R1;
+
+        const double rP = (std::fabs(dC) < 1e-12) ? 0.0 : dR / dC;
+        const double rM = (std::fabs(dC) < 1e-12) ? 0.0 : dL / dC;
+
+        const double xiP = freeze ? 1.0 : xi_vanleer(rP);
+        const double xiM = freeze ? 1.0 : xi_vanleer(rM);
+
+        const double corrL = (eps/4.0) * ((1-kappa)*xiP*(C-LL) + (1+kappa)*xiM*(R1-C));
+        const double corrR = (eps/4.0) * ((1-kappa)*xiM*(R2-R1) + (1+kappa)*xiP*(R1-C));
+
+        L.*set = C  + corrL;
+        R.*set = R1 - corrR;
+    };
+
+    rec([](auto&p){return p.rho;}, &Primitive::rho);
+    rec([](auto&p){return p.u;  }, &Primitive::u);
+    rec([](auto&p){return p.v;  }, &Primitive::v);
+    rec([](auto&p){return p.P;  }, &Primitive::P);
+
+    clampPrim(L);
+    clampPrim(R);
+}
+
+inline void musclJ(const std::vector<std::vector<Primitive>>& V, int i,int j,
+                   int order,double kappa,bool freeze, Primitive& L, Primitive& R)
+{
+    const double eps = (order==2 ? 1.0 : 0.0);
+
+    auto rec = [&](auto get, auto set){
+        const double BB = get(V[i][j-1]);
+        const double C  = get(V[i][j  ]);
+        const double T1 = get(V[i][j+1]);
+        const double T2 = get(V[i][j+2]);
+
+        const double dC = T1 - C;
+        const double dB = C  - BB;
+        const double dT = T2 - T1;
+
+        const double rP = (std::fabs(dC) < 1e-12) ? 0.0 : dT / dC;
+        const double rM = (std::fabs(dC) < 1e-12) ? 0.0 : dB / dC;
+
+        const double xiP = freeze ? 1.0 : xi_vanleer(rP);
+        const double xiM = freeze ? 1.0 : xi_vanleer(rM);
+
+        const double corrL = (eps/4.0) * ((1-kappa)*xiP*(C-BB) + (1+kappa)*xiM*(T1-C));
+        const double corrR = (eps/4.0) * ((1-kappa)*xiM*(T2-T1) + (1+kappa)*xiP*(T1-C));
+
+        L.*set = C  + corrL;
+        R.*set = T1 - corrR;
+    };
+
+    rec([](auto&p){return p.rho;}, &Primitive::rho);
+    rec([](auto&p){return p.u;  }, &Primitive::u);
+    rec([](auto&p){return p.v;  }, &Primitive::v);
+    rec([](auto&p){return p.P;  }, &Primitive::P);
+
+    clampPrim(L);
+    clampPrim(R);
+}
+
 //------------------------------------------------------------------------------
 // computeResidualMMS
 //
@@ -1676,7 +1712,7 @@ int main() {
 
   int fluxOrder = 2;  // Second-order MUSCL
   double kappa = 0.5; // Choose limiter parameter (e.g., -1, 0, 0.5, or 1)
-  bool freezeLimiter = false;  // Set to true for pure MUSCL (no limiter)
+  bool freezeLimiter = true;  // Set to true for pure MUSCL (no limiter)
 
     // Create an output folder if needed.
     string outFolder = "OutputFiles";
@@ -1847,8 +1883,8 @@ int main() {
 
 
         // Pseudo-time marching parameters
-    const int maxIter = 1000;
-    const int writeInterval = 200;
+    const int maxIter = 100;
+    const int writeInterval = 5;
     double tol = 1e-8;             // convergence tolerance
  
 
