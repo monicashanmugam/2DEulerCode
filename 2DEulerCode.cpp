@@ -26,7 +26,7 @@ constexpr double L     = 1.0;     // domain length
 
 static constexpr int ghost = 2;
 
-const double CFL       = 0.01;    // CFL number for time step control
+const double CFL       = 0.1;    // CFL number for time step control
 const double epsM      = 0.01;    // Minimum Mach number allowed
 const double tolerance = 1e-12;
 const double delta     = 1e-6;    // small number used in limiters, etc.
@@ -36,9 +36,8 @@ std::vector<std::vector<double>> x_node;
 std::vector<std::vector<double>> y_node;
 
 static_assert(ghost >= 2, "MUSCL reconstruction needs at least 2 ghost cells.");
-
 //-----------------------------------------------------
-// Primitive and Conserved definitions
+// Primitive & Conserved
 //-----------------------------------------------------
 struct Primitive {
     double rho;  // density
@@ -55,15 +54,26 @@ struct Conserved {
 };
 
 //-----------------------------------------------------
-// Global Arrays for the CFD Solver
+// Global arrays and sizes
 //-----------------------------------------------------
 int imax = 0, jmax = 0;
-int kmax; // (unused here)
-
 static std::vector<std::vector<Conserved>> U;
 static std::vector<std::vector<Primitive>> V;
 
-// Inline operator overloads for Conserved
+//-----------------------------------------------------
+// Small helpers
+//-----------------------------------------------------
+inline double sq(double x) { return x*x; }
+
+// Safe kinetic energy per *volume* from conserved
+inline double KE_vol(const Conserved& Uc) {
+    if (Uc.rho <= 0.0) return 0.0;
+    return 0.5 * (sq(Uc.rhou) + sq(Uc.rhov)) / Uc.rho;
+}
+
+//-----------------------------------------------------
+// Operators for Conserved
+//-----------------------------------------------------
 inline Conserved operator+(const Conserved& a, const Conserved& b) {
     return { a.rho + b.rho, a.rhou + b.rhou, a.rhov + b.rhov, a.E + b.E };
 }
@@ -71,99 +81,64 @@ inline Conserved operator-(const Conserved& a, const Conserved& b) {
     return { a.rho - b.rho, a.rhou - b.rhou, a.rhov - b.rhov, a.E - b.E };
 }
 inline Conserved operator*(double s, const Conserved& b) {
-    return { s * b.rho, s * b.rhou, s * b.rhov, s * b.E };
+    return { s*b.rho, s*b.rhou, s*b.rhov, s*b.E };
 }
 inline Conserved operator/(const Conserved& a, double s) {
-    return { a.rho / s, a.rhou / s, a.rhov / s, a.E / s };
+    return { a.rho/s, a.rhou/s, a.rhov/s, a.E/s };
 }
 inline Conserved& operator+=(Conserved& a, const Conserved& b) {
-    a.rho  += b.rho;
-    a.rhou += b.rhou;
-    a.rhov += b.rhov;
-    a.E    += b.E;
-    return a;
+    a.rho  += b.rho;  a.rhou += b.rhou;  a.rhov += b.rhov;  a.E += b.E; return a;
 }
 inline Conserved& operator-=(Conserved& a, const Conserved& b) {
-    a.rho  -= b.rho;
-    a.rhou -= b.rhou;
-    a.rhov -= b.rhov;
-    a.E    -= b.E;
-    return a;
+    a.rho  -= b.rho;  a.rhou -= b.rhou;  a.rhov -= b.rhov;  a.E -= b.E; return a;
 }
 
-//------------------------------------------------------------------------------
-// Global Limits for Primitive variables
-//------------------------------------------------------------------------------
-const double RHO_MIN = 1e-3;
-const double RHO_MAX = 5.0;
+//-----------------------------------------------------
+// Physical bounds (primitives)
+//-----------------------------------------------------
+constexpr double RHO_MIN = 1e-6, RHO_MAX = 10.0;
+constexpr double U_MIN   = -2e3, U_MAX   =  2e3;
+constexpr double V_MIN   = -2e3, V_MAX   =  2e3;
+constexpr double P_MIN   = 1e-8, P_MAX   =  1e7;
 
-const double U_MIN   = -1000.0;
-const double U_MAX   = 2000.0;
-const double V_MIN   = -1000.0;
-const double V_MAX   = 2000.0;
+// "Loose" bounds for conserved (used for ρ and momenta only)
+// Energy is clamped with a *kinetic-energy-aware* floor/ceiling below.
+constexpr double U1_MIN = 0.5*RHO_MIN,  U1_MAX = 2.0*RHO_MAX;
+constexpr double U2_MIN = U1_MIN*U_MIN, U2_MAX = U1_MAX*U_MAX;  // ρu
+constexpr double U3_MIN = U1_MIN*V_MIN, U3_MAX = U1_MAX*V_MAX;  // ρv
 
-const double P_MIN   = 1e-8;
-const double P_MAX   = 1e6;
-
-//------------------------------------------------------------------------------
-// Global Limits for Conserved variables
-//------------------------------------------------------------------------------
-const double U1_MIN = RHO_MIN;
-const double U1_MAX = RHO_MAX * 2.0;
-
-const double U2_MIN = RHO_MIN * U_MIN * 2.0;   // rho*u
-const double U2_MAX = RHO_MAX * U_MAX * 2.0;
-
-const double U3_MIN = RHO_MIN * V_MIN * 2.0;   // rho*v
-const double U3_MAX = RHO_MAX * V_MAX * 2.0;
-
-const double U4_MIN = P_MIN / (gamma - 1.0);  // energy density lower bound
-const double U4_MAX = P_MAX / (gamma - 1.0)
-                    + 0.5 * RHO_MAX * (U_MAX*U_MAX + V_MAX*V_MAX);
-
-// Clamp helpers
+//-----------------------------------------------------
+// Clamp helpers (with short, informative logs)
+//-----------------------------------------------------
 void ApplyLimitsToPrimitive(const std::string& when,
                             std::vector<std::vector<Primitive>>& Varr)
 {
-    int ni = (int)Varr.size();
-    if (ni == 0) return;
-    int nj = (int)Varr[0].size();
+    if (Varr.empty()) return;
+    const int ni = (int)Varr.size(), nj = (int)Varr[0].size();
 
-    std::vector<std::pair<int,int>> clampedCells;
-    clampedCells.reserve(5);
+    std::vector<std::pair<int,int>> examples;
+    examples.reserve(5);
 
     for (int i = 0; i < ni; ++i) {
         for (int j = 0; j < nj; ++j) {
             bool clamped = false;
-            auto& cell = Varr[i][j];
+            auto& c = Varr[i][j];
 
-            double new_rho = std::clamp(cell.rho, RHO_MIN, RHO_MAX);
-            if (new_rho != cell.rho) { clamped = true; cell.rho = new_rho; }
+            double r = std::clamp(c.rho, RHO_MIN, RHO_MAX); clamped |= (r != c.rho); c.rho = r;
+            double u = std::clamp(c.u,   U_MIN,   U_MAX);   clamped |= (u != c.u);   c.u   = u;
+            double v = std::clamp(c.v,   V_MIN,   V_MAX);   clamped |= (v != c.v);   c.v   = v;
+            double p = std::clamp(c.P,   P_MIN,   P_MAX);   clamped |= (p != c.P);   c.P   = p;
 
-            double new_u = std::clamp(cell.u, U_MIN, U_MAX);
-            if (new_u != cell.u) { clamped = true; cell.u = new_u; }
-
-            double new_v = std::clamp(cell.v, V_MIN, V_MAX);
-            if (new_v != cell.v) { clamped = true; cell.v = new_v; }
-
-            double new_P = std::clamp(cell.P, P_MIN, P_MAX);
-            if (new_P != cell.P) { clamped = true; cell.P = new_P; }
-
-            if (clamped && clampedCells.size() < 5) {
-                clampedCells.emplace_back(i, j);
-            }
+            if (clamped && examples.size() < 5) examples.emplace_back(i, j);
         }
     }
 
-    if (!clampedCells.empty()) {
+    if (!examples.empty()) {
         std::cerr << "[WARNING] Clamped primitive vars"
                   << (when.empty() ? "" : " (" + when + ")")
-                  << " in "
-                  << clampedCells.size()
-                  << " cell" << (clampedCells.size() > 1 ? "s" : "")
-                  << ", e.g. ";
-        for (auto [i,j] : clampedCells) std::cerr << "(" << i << "," << j << ") ";
-        if (clampedCells.size() == 5) std::cerr << "…";
+                  << " in " << examples.size() << " cell(s), e.g. ";
+        for (auto [i,j] : examples) std::cerr << "(" << i << "," << j << ") ";
+        if (examples.size() == 5) std::cerr << "…";
         std::cerr << "\n";
     }
 }
@@ -171,114 +146,100 @@ void ApplyLimitsToPrimitive(const std::string& when,
 void ApplyLimitsToConserved(const std::string& when,
                             std::vector<std::vector<Conserved>>& Uarr)
 {
-    int ni = (int)Uarr.size();
-    if (ni == 0) return;
-    int nj = (int)Uarr[0].size();
+    if (Uarr.empty()) return;
+    const int ni = (int)Uarr.size(), nj = (int)Uarr[0].size();
 
-    std::vector<std::pair<int,int>> clampedCells;
-    clampedCells.reserve(5);
+    std::vector<std::pair<int,int>> examples;
+    examples.reserve(5);
 
     for (int i = 0; i < ni; ++i) {
         for (int j = 0; j < nj; ++j) {
             bool clamped = false;
-            auto& cell = Uarr[i][j];
+            auto& c = Uarr[i][j];
 
-            double new_rho  = std::clamp(cell.rho,  U1_MIN, U1_MAX);
-            if (new_rho != cell.rho) { clamped = true; cell.rho = new_rho; }
+            // 1) Clamp density & momenta with broad box bounds
+            double rho  = std::clamp(c.rho,  U1_MIN, U1_MAX); clamped |= (rho  != c.rho);  c.rho  = rho;
+            double rhou = std::clamp(c.rhou, U2_MIN, U2_MAX); clamped |= (rhou != c.rhou); c.rhou = rhou;
+            double rhov = std::clamp(c.rhov, U3_MIN, U3_MAX); clamped |= (rhov != c.rhov); c.rhov = rhov;
 
-            double new_rhou = std::clamp(cell.rhou, U2_MIN, U2_MAX);
-            if (new_rhou != cell.rhou) { clamped = true; cell.rhou = new_rhou; }
+            // 2) Clamp *energy* with a kinetic-energy-aware floor/ceiling:
+            //    E >= KE + P_MIN/(γ-1),  E <= KE + P_MAX/(γ-1)
+            const double ke   = KE_vol(c);
+            const double Emin = ke + P_MIN/(gamma - 1.0);
+            const double Emax = ke + P_MAX/(gamma - 1.0);
+            double Enew = std::clamp(c.E, Emin, Emax);
+            clamped |= (Enew != c.E);
+            c.E = Enew;
 
-            double new_rhov = std::clamp(cell.rhov, U3_MIN, U3_MAX);
-            if (new_rhov != cell.rhov) { clamped = true; cell.rhov = new_rhov; }
-
-            double new_E    = std::clamp(cell.E,    U4_MIN, U4_MAX);
-            if (new_E != cell.E) { clamped = true; cell.E = new_E; }
-
-            if (clamped && clampedCells.size() < 5) {
-                clampedCells.emplace_back(i, j);
-            }
+            if (clamped && examples.size() < 5) examples.emplace_back(i, j);
         }
     }
 
-    if (!clampedCells.empty()) {
+    if (!examples.empty()) {
         std::cerr << "[WARNING] Clamped conserved vars"
                   << (when.empty() ? "" : " (" + when + ")")
-                  << " in "
-                  << clampedCells.size()
-                  << " cell" << (clampedCells.size() > 1 ? "s" : "")
-                  << ", e.g. ";
-        for (auto [i,j] : clampedCells) std::cerr << "(" << i << "," << j << ") ";
-        if (clampedCells.size() == 5) std::cerr << "…";
+                  << " in " << examples.size() << " cell(s), e.g. ";
+        for (auto [i,j] : examples) std::cerr << "(" << i << "," << j << ") ";
+        if (examples.size() == 5) std::cerr << "…";
         std::cerr << "\n";
     }
 }
 
 //-----------------------------------------------------
-// Conversion Functions (cell-wise)
+// W ↔ U conversions (cell-wise, correct & consistent)
 //-----------------------------------------------------
-Conserved PrimitiveToConserved(const Primitive& Vcell) {
-    const double q2   = Vcell.u*Vcell.u + Vcell.v*Vcell.v;
-    const double Evol = Vcell.P / (gamma - 1.0) + 0.5 * Vcell.rho * q2;
-
-    Conserved Ucell;
-    Ucell.rho  = Vcell.rho;
-    Ucell.rhou = Vcell.rho * Vcell.u;
-    Ucell.rhov = Vcell.rho * Vcell.v;
-    Ucell.E    = Evol;  // total energy per volume
-    return Ucell;
+inline Conserved PrimitiveToConserved(const Primitive& W) {
+    const double q2 = W.u*W.u + W.v*W.v;
+    return {
+        W.rho,
+        W.rho * W.u,
+        W.rho * W.v,
+        W.P / (gamma - 1.0) + 0.5 * W.rho * q2
+    };
 }
 
-Primitive ConservedToPrimitiveCell(const Conserved& Ucell) {
-    Primitive Vcell;
-    Vcell.rho = Ucell.rho;
+inline Primitive ConservedToPrimitiveCell(const Conserved& Uc) {
+    Primitive W{};
 
-    if (std::fabs(Ucell.rho) < 1e-12) {
-        Vcell.u = 0.0;
-        Vcell.v = 0.0;
-        // With rho ~ 0, just give a tiny positive pressure
-        Vcell.P = P_MIN;
-        return Vcell;
+    W.rho = Uc.rho;
+    if (W.rho <= 1e-12) { // vacuum guard
+        W.u = 0.0; W.v = 0.0; W.P = P_MIN;
+        return W;
     }
 
-    Vcell.u = Ucell.rhou / Ucell.rho;
-    Vcell.v = Ucell.rhov / Ucell.rho;
-    // U.E = p/(gamma-1) + 0.5*rho*(u^2+v^2)
+    W.u = Uc.rhou / W.rho;
+    W.v = Uc.rhov / W.rho;
 
-    const double KE_vol = 0.5 * (Ucell.rhou*Ucell.rhou + Ucell.rhov*Ucell.rhov) / Ucell.rho;
-    
-    Vcell.P = (gamma - 1.0) * (Ucell.E - 0.5 * KE_vol);
+    // E = p/(γ-1) + ½ρ(u²+v²)  ⇒  p = (γ-1)*(E - KE_vol)
+    const double p = (gamma - 1.0) * (Uc.E - KE_vol(Uc));
+    W.P = (p > P_MIN) ? p : P_MIN;  // enforce positivity
 
-    if (Vcell.P < P_MIN) Vcell.P = P_MIN;
-    return Vcell;
+    return W;
 }
 
 //-----------------------------------------------------
-// Global Conversion Routines
+// Global conversions
 //-----------------------------------------------------
 void GlobalConservedToPrimitive() {
-    int Ni = imax + 2*ghost, Nj = jmax + 2*ghost;
-    V.resize(Ni);
-    for (int i = 0; i < Ni; ++i) V[i].resize(Nj);
-
+    const int Ni = imax + 2*ghost, Nj = jmax + 2*ghost;
+    V.assign(Ni, std::vector<Primitive>(Nj));
     for (int i = 0; i < Ni; ++i)
         for (int j = 0; j < Nj; ++j)
             V[i][j] = ConservedToPrimitiveCell(U[i][j]);
 
-    ApplyLimitsToPrimitive("after U→V conversion", V);
+    ApplyLimitsToPrimitive("after U→V", V);
 }
 
 void GlobalPrimitiveToConserved() {
-    int Ni = imax + 2*ghost, Nj = jmax + 2*ghost;
-    U.resize(Ni);
-    for (int i = 0; i < Ni; ++i) U[i].resize(Nj);
-
+    const int Ni = imax + 2*ghost, Nj = jmax + 2*ghost;
+    U.assign(Ni, std::vector<Conserved>(Nj));
     for (int i = 0; i < Ni; ++i)
         for (int j = 0; j < Nj; ++j)
             U[i][j] = PrimitiveToConserved(V[i][j]);
 
-    ApplyLimitsToConserved("after V→U conversion", U);
+    ApplyLimitsToConserved("after V→U", U);
 }
+
 
 // ---------- Vector type + operators ----------
 struct Vec { double x, y; };
@@ -650,13 +611,13 @@ struct MmsParams {
 // === MMS parameter sets (definitions) ========================================
 const MmsParams mmsSup = {
     /*rho0,rho_x,rho_y,rho_z, a_rho_x,a_rho_y,a_rho_z*/
-    1.0,   0.10,  0.08,  0.0,  0,0,0,
+    1.0,   0.15,  -0.1,  0,  1, 0.5, 0,
     /*u0,  u_x,   u_y,   u_z,  a_u_x, a_u_y, a_u_z*/
-    300.0, 20.0,  15.0,  0.0,  0,0,0,
+    800.0, 50.0,  -30.0,  0.0,  1.5,0.6,0,
     /*v0,  v_x,   v_y,   v_z,  a_v_x, a_v_y, a_v_z*/
-    0.0,   15.0,  12.0,  0.0,  0,0,0,
+    800,   -75,  40,  0,  0.5 , 1.5, 0,
     /*p0,     p_x,    p_y,    p_z,  a_p_x,a_p_y,a_p_z*/
-    101325.0, 8000.0, 6000.0, 0.0,  0,0,0
+    100000, 20000, 50000, 0.0,  0.666 , 1, 0
 };
 
 const MmsParams mmsSub = {
@@ -770,53 +731,79 @@ inline double ymtmconv(int mmsCase, double L, double x, double y) {
     return term1 - term2 + term3 + term4 + term5 - term6;
 }
 
-// Energy (per your notebook: E = 0.5(u^2+v^2) + p/[(γ−1)ρ] in the flux)
-inline double energyconv(int mmsCase, double gamma, double L, double x, double y) {
+
+inline double energyconv(int mmsCase, double gamma, double L, double x, double y, double w0 = 0.0)
+{
     const auto& C = Csel(mmsCase);
 
-    const double rhoPhi = C.rho0
-        + C.rho_x * std::sin((PI * x) / L)
-        + C.rho_y * std::cos((PI * y) / (2.0 * L));
-    const double uPhi = C.u0
-        + C.u_x * std::sin((3.0 * PI * x) / (2.0 * L))
-        + C.u_y * std::cos((3.0 * PI * y) / (5.0 * L));
-    const double vPhi = C.v0
-        + C.v_x * std::cos((PI * x) / (2.0 * L))
-        + C.v_y * std::sin((2.0 * PI * y) / (3.0 * L));
-    const double pPhi = C.p0
-        + C.p_x * std::cos((2.0 * PI * x) / L)
-        + C.p_y * std::sin((PI * y) / L);
+    // Primitives from your MMS definitions
+    const double rho = C.rho0
+        + C.rho_x * std::sin(PI * x / L)
+        + C.rho_y * std::cos(PI * y / (2.0 * L));
 
-    const double vel2 = uPhi*uPhi + vPhi*vPhi;
-    const double Eeq  = 0.5 * vel2 + pPhi / ((gamma - 1.0) * rhoPhi);
+    const double u = C.u0
+        + C.u_x * std::sin(3.0 * PI * x / (2.0 * L))
+        + C.u_y * std::cos(3.0 * PI * y / (5.0 * L));
 
-    // bracket1: x-coupled terms
-    const double A  = -2.0 * PI * C.p_x * std::sin((2.0 * PI * x) / L) / L;
-    const double B  = rhoPhi * ( -2.0 * PI * C.p_x * std::sin((2.0 * PI * x) / L) / ((gamma - 1.0) * L * rhoPhi)
-                   + ( (3.0 * PI * C.u_x * std::cos((3.0 * PI * x) / (2.0 * L)) * uPhi
-                     -       PI * C.v_x * std::sin((PI * x) / (2.0 * L)) * vPhi) / L ) ) * 0.5;
-    const double C1 = -PI * C.rho_x * std::cos((PI * x) / L) * pPhi / ((gamma - 1.0) * L * rhoPhi * rhoPhi);
-    const double bracket1 = A + B + C1;
+    const double v = C.v0
+        + C.v_x * std::cos(PI * x / (2.0 * L))
+        + C.v_y * std::sin(2.0 * PI * y / (3.0 * L));
 
-    const double term1 = uPhi * bracket1;
-    const double term2 = (PI * C.rho_x * std::cos((PI * x) / L) * Eeq) / L;
-    const double term3 = (3.0 * PI * C.u_x * std::cos((3.0 * PI * x) / (2.0 * L)) * (pPhi + rhoPhi * Eeq)) / (2.0 * L);
-    const double term4 = (2.0 * PI * C.v_y * std::cos((2.0 * PI * y) / (3.0 * L)) * (pPhi + rhoPhi * Eeq)) / (3.0 * L);
+    const double p = C.p0
+        + C.p_x * std::cos(2.0 * PI * x / L)
+        + C.p_y * std::sin(PI * y / L);
 
-    // bracket2: y pressure gradient & rho_y coupling
-    const double bracket2 = (PI * C.p_y * std::cos((PI * y) / L)) / L
-                          - (PI * C.rho_y * std::sin((PI * y) / (2.0 * L)) * vPhi) / (2.0 * L);
-    const double term5 = vPhi * bracket2;
+    // Specific total energy (include w0 if your MMS has it)
+    const double vel2 = u*u + v*v + w0*w0;
+    const double Eeq  = 0.5 * vel2 + p / ((gamma - 1.0) * rho);
 
-    // bracket3: y-derivatives in energy transport
-    const double bracket3 = (PI * C.p_y * std::cos((PI * y) / L)) / ((gamma - 1.0) * L * rhoPhi)
-                          + ( (-6.0 * PI * C.u_y * uPhi * std::sin((3.0 * PI * y) / (5.0 * L))) / (5.0 * L)
-                              + (4.0 * PI * C.v_y * std::cos((2.0 * PI * y) / (3.0 * L)) * vPhi) / (3.0 * L) ) * 0.5
-                          + (PI * C.rho_y * std::sin((PI * y) / (2.0 * L)) * pPhi) / (2.0 * (gamma - 1.0) * L * rhoPhi * rhoPhi);
-    const double term6 = rhoPhi * bracket3;
+    // ----- u * [ ... ]  -----
+    // - (2π pressx sin(2πx/L))/L
+    const double A_x = -2.0 * PI * C.p_x * std::sin(2.0 * PI * x / L) / L;
 
-    return term1 + term2 + term3 + term4 + term5 + term6;
+    // + rho * [ -(2π pressx sin(2πx/L))/((γ-1)L ρ)  +  1/2 * ( 1/L * (3π u_x cos(...) * u) - 1/L * (π v_x sin(...) * v) ) ]
+    const double vel_x_part = ( 3.0 * PI * C.u_x * std::cos(3.0 * PI * x / (2.0 * L)) * u
+                              -       PI * C.v_x * std::sin(      PI * x / (2.0 * L)) * v ) / L;
+    const double B_x = rho * ( -2.0 * PI * C.p_x * std::sin(2.0 * PI * x / L) / ((gamma - 1.0) * L * rho)
+                               + 0.5 * vel_x_part );
+
+    // - (π rhox cos(πx/L) * p) / ( (γ-1) L ρ^2 )
+    const double C_x = - PI * C.rho_x * std::cos(PI * x / L) * p / ((gamma - 1.0) * L * rho * rho);
+
+    const double term_u = u * (A_x + B_x + C_x);
+
+    // + (π rhox cos(πx/L))/L * Eeq
+    const double term_rhox_E = (PI * C.rho_x * std::cos(PI * x / L) / L) * Eeq;
+
+    // + (3π u_x cos(3πx/(2L)))/(2L) * (p + ρ Eeq)
+    const double term_ux = (3.0 * PI * C.u_x * std::cos(3.0 * PI * x / (2.0 * L)) / (2.0 * L)) * (p + rho * Eeq);
+
+    // + (2π v_y cos(2πy/(3L)))/(3L) * (p + ρ Eeq)
+    const double term_vy = (2.0 * PI * C.v_y * std::cos(2.0 * PI * y / (3.0 * L)) / (3.0 * L)) * (p + rho * Eeq);
+
+    // ----- v * [ ... ]  -----
+    // (π pressy cos(πy/L))/L
+    const double Ay = (PI * C.p_y * std::cos(PI * y / L)) / L;
+
+    // - (π rhoy sin(πy/(2L)))/(2L) * Eeq
+    const double Ey = - (PI * C.rho_y * std::sin(PI * y / (2.0 * L)) / (2.0 * L)) * Eeq;
+
+    // + rho * [ (π pressy cos(πy/L))/((γ-1)L ρ)
+    //           + 1/2 * ( - (6π u_y u sin(3πy/(5L)))/(5L) + (4π v_y v cos(2πy/(3L)))/(3L) )
+    //           + (π rhoy sin(πy/(2L)) p)/(2 (γ-1) L ρ^2) ]
+    const double y_vel_part = - (6.0 * PI * C.u_y * u * std::sin(3.0 * PI * y / (5.0 * L))) / (5.0 * L)
+                              + (4.0 * PI * C.v_y * v * std::cos(2.0 * PI * y / (3.0 * L))) / (3.0 * L);
+
+    const double bracket_y = (PI * C.p_y * std::cos(PI * y / L)) / ((gamma - 1.0) * L * rho)
+                           + 0.5 * y_vel_part
+                           + (PI * C.rho_y * std::sin(PI * y / (2.0 * L)) * p) / (2.0 * (gamma - 1.0) * L * rho * rho);
+
+    const double term_v = v * ( Ay + Ey + rho * bracket_y );
+
+    // Sum
+    return term_u + term_rhox_E + term_ux + term_vy + term_v;
 }
+
 
 void init_mms_fs(int mmsCase, double L,
                  const std::vector<std::vector<double>>& x_cell,
@@ -942,175 +929,230 @@ double compute_dt_CFL(double CFLnum,
 
 // =========================== 2D van Leer flux (with MUSCL) ===========================
 
-// --- split coefficients (van Leer 1982) ---
-inline double Cplus (double M){ if (M<=-1) return 0.0; else if (M<1) return 0.25*(M+1)*(M+1); else return M; }
-inline double Cminus(double M){ if (M<=-1) return M;   else if (M<1) return -0.25*(M-1)*(M-1); else return 0.0; }
-inline double Dplus (double M){ if (M<=-1) return 0.0; else if (M<1) return 0.25*(M+1)*(M+1)*(-M+2.0); else return 1.0; }
-inline double Dminus(double M){ if (M<=-1) return 1.0; else if (M<1) return -0.25*(M-1)*(M-1)*(-M-2.0); else return 0.0; }
-
 //------------------------------------------------------------------------------
 // Helper function: safeDenom
 // Returns d if |d| >= delta, else returns delta with the same sign as d.
 //------------------------------------------------------------------------------
-inline double safeDenom(double d, double delta_val = delta) {
-    return (fabs(d) < delta_val) ? ((d >= 0.0) ? delta_val : -delta_val) : d;
+#ifndef VL_DELTA_DEFINED
+#define VL_DELTA_DEFINED
+static constexpr double VL_DELTA = 1e-12;
+#endif
+
+inline double safeDenom(double d, double delta_val = VL_DELTA) {
+    return (std::fabs(d) < delta_val) ? ((d >= 0.0) ? delta_val : -delta_val) : d;
 }
 
 //------------------------------------------------------------------------------
-// Van Leer limiter: ξ(r) = (r + |r|) / (1 + r)
+// Van Leer limiter: ξ(r) = (r + |r|) / (1 + r)
 //------------------------------------------------------------------------------
 inline double xi(double r) {
-    return (r + fabs(r)) / (1.0 + r);
+    return (r + std::fabs(r)) / (1.0 + r);
 }
 
-// ---- small helper: clamp reconstructed primitives for safety ----
+//------------------------------------------------------------------------------
+// ******************* FLUX SPLITTING FUNCTIONS (van Leer) *******************
+// α/β representation produces the same C± as the classic polynomials.
+//------------------------------------------------------------------------------
+
+inline double alpha_plus (double M) { return (M >  0.0) ? 1.0 : 0.0; }
+inline double alpha_minus(double M) { return (M <  0.0) ? 1.0 : 0.0; }
+inline double beta_sensor(double M) { return (std::fabs(M) < 1.0) ? -1.0 : 0.0; }
+
+// subsonic quadratic pieces
+inline double Mplus_poly (double M){ return  0.25*(M+1.0)*(M+1.0); }
+inline double Mminus_poly(double M){ return -0.25*(M-1.0)*(M-1.0); }
+
+// C± with α/β form (equivalent to classic van Leer)
+inline double Cplus(double M) {
+    const double beta = beta_sensor(M);
+    if (beta == 0.0) return alpha_plus(M)*M;  // supersonic-right
+    return Mplus_poly(M);                     // subsonic
+}
+inline double Cminus(double M) {
+    const double beta = beta_sensor(M);
+    if (beta == 0.0) return alpha_minus(M)*M; // supersonic-left
+    return Mminus_poly(M);                    // subsonic
+}
+
+// Pressure split polynomials D± (standard van Leer)
+inline double Dplus (double M){
+    if (M <= -1.0) return 0.0;
+    if (M <   1.0) return Mplus_poly(M)  * (-M + 2.0);
+    return 1.0;
+}
+inline double Dminus(double M){
+    if (M <= -1.0) return 1.0;
+    if (M <   1.0) return Mminus_poly(M) * (-M - 2.0);
+    return 0.0;
+}
+
+//------------------------------------------------------------------------------
+// Safety clamp for reconstructed primitives
+//------------------------------------------------------------------------------
 inline void clamp_primitive(Primitive& W){
     if (W.rho < RHO_MIN) W.rho = RHO_MIN;
     if (W.P   < P_MIN  ) W.P   = P_MIN;
-    // (optional) clamp velocities to your U/V bounds if you like
+    // (optional) clamp velocities to U/V bounds if desired
 }
 
-// van Leer normal flux from L/R primitive states at a face with normal (nx,ny)
-inline Conserved vl_flux_n(const Primitive& WL, const Primitive& WR, double nx, double ny)
+//------------------------------------------------------------------------------
+// ******** First-order van Leer flux in 2D along a face normal (nx, ny) ********
+// Uses normal Mach  M = (u·n)/a
+// Energy uses 2D total enthalpy: H = γ/(γ-1)*P/ρ + 0.5*(u^2+v^2)
+// Pressure split only contributes to momentum along n.
+//------------------------------------------------------------------------------
+inline Conserved ComputeFaceFluxVanLeerFirstOrderNormal(
+    const Primitive& VL, const Primitive& VR,
+    double nx, double ny)
 {
-    // left state
-    const double aL  = std::sqrt(gamma * WL.P / WL.rho);
-    const double unL = WL.u*nx + WL.v*ny;
+    // Left
+    const double aL  = std::sqrt(gamma * VL.P / VL.rho);
+    const double unL = VL.u*nx + VL.v*ny;
     const double ML  = unL / aL;
-    const double CpL = Cplus(ML), DpL = Dplus(ML);
-    const double qL2 = WL.u*WL.u + WL.v*WL.v;
-    const double HL  = (gamma/(gamma-1.0))*(WL.P/WL.rho) + 0.5*qL2;
+    const double CpL = Cplus(ML);
+    const double DpL = Dplus(ML);
+    const double qL2 = VL.u*VL.u + VL.v*VL.v;
+    const double HL  = (gamma/(gamma-1.0))*(VL.P/VL.rho) + 0.5*qL2;
 
-    // right state
-    const double aR  = std::sqrt(gamma * WR.P / WR.rho);
-    const double unR = WR.u*nx + WR.v*ny;
+    // Right
+    const double aR  = std::sqrt(gamma * VR.P / VR.rho);
+    const double unR = VR.u*nx + VR.v*ny;
     const double MR  = unR / aR;
-    const double CmR = Cminus(MR), DmR = Dminus(MR);
-    const double qR2 = WR.u*WR.u + WR.v*WR.v;
-    const double HR  = (gamma/(gamma-1.0))*(WR.P/WR.rho) + 0.5*qR2;  // <- fixed
+    const double CmR = Cminus(MR);
+    const double DmR = Dminus(MR);
+    const double qR2 = VR.u*VR.u + VR.v*VR.v;
+    const double HR  = (gamma/(gamma-1.0))*(VR.P/VR.rho) + 0.5*qR2;
 
-    // convective mass fluxes (per unit length)
-    const double mL = WL.rho * aL * CpL;
-    const double mR = WR.rho * aR * CmR;
+    // Convective mass fluxes (per unit length)
+    const double mL  = VL.rho * aL * CpL;
+    const double mR  = VR.rho * aR * CmR;
 
-    Conserved Fn;
-    Fn.rho  = mL + mR;
-    Fn.rhou = mL*WL.u + mR*WR.u + (DpL*WL.P + DmR*WR.P)*nx;
-    Fn.rhov = mL*WL.v + mR*WR.v + (DpL*WL.P + DmR*WR.P)*ny;
-    Fn.E    = mL*HL   + mR*HR;
-    return Fn;
+    Conserved F;
+    F.rho  = mL + mR;
+
+    const double pSplit = DpL*VL.P + DmR*VR.P;   // only to momentum along n
+    F.rhou = mL*VL.u + mR*VR.u + pSplit*nx;
+    F.rhov = mL*VL.v + mR*VR.v + pSplit*ny;
+
+    // Energy convective with total enthalpy
+    F.E    = mL*HL   + mR*HR;
+
+    return F;
 }
 
-
-// ---- MUSCL (κ-scheme) reconstruction on an i-face (between cells i-1 and i) ----
-inline void muscl_reconstruct_i(const std::vector<std::vector<Primitive>>& V,
+//------------------------------------------------------------------------------
+// ******************* MUSCL (κ-scheme) reconstruction *******************
+// i-face: between cells (i-1, j) and (i, j)
+//------------------------------------------------------------------------------
+inline void muscl_reconstruct_i(const std::vector<std::vector<Primitive>>& Varr,
                                 int i_face, int j,
                                 int order, double kappa, bool freezeLimiter,
                                 Primitive& WL, Primitive& WR)
 {
-    const int I = (int)V.size();
-    const int il = i_face - 1;   // left cell
-    const int ir = i_face;       // right cell
+    const int I = (int)Varr.size();
+    const int il = i_face - 1;   // left cell index
+    const int ir = i_face;       // right cell index
 
     auto recon_scalar = [&](auto getter)->std::pair<double,double>{
-        const double v_i   = getter(il  ,j);
-        const double v_ip1 = getter(ir  ,j);
+        const double v_i   = getter(il, j);
+        const double v_ip1 = getter(ir, j);
         double vL = v_i, vR = v_ip1;
 
-        if (order == 2 && il-2>=0 && ir+1<I){
-            const double v_im1 = getter(il-1,j);
-            const double v_ip2 = getter(ir+1,j);
+        if (order == 2 && il-1 >= 0 && ir+1 < I){
+            const double v_im1 = getter(il-1, j);
+            const double v_ip2 = getter(ir+1, j);
 
-            const double d0   = safeDenom(v_ip1 - v_i);
-            const double r_p  = (v_ip2 - v_ip1) / d0;    // r+ at i+1/2
-            const double r_m  = (v_i   - v_im1) / d0;    // r- at i+1/2
+            const double d0  = safeDenom(v_ip1 - v_i);
+            const double r_p = (v_ip2 - v_ip1) / d0; // r+ at i+1/2
+            const double r_m = (v_i   - v_im1) / d0; // r- at i+1/2
             const double xi_p = freezeLimiter ? 1.0 : xi(r_p);
             const double xi_m = freezeLimiter ? 1.0 : xi(r_m);
 
-            const double d1   = safeDenom(v_ip2 - v_ip1);
-            const double r_m_ip1  = (v_ip1 - v_i) / d1;
-            const double xi_m_ip1 = freezeLimiter ? 1.0 : xi(r_m_ip1);
+            const double d1         = safeDenom(v_ip2 - v_ip1);
+            const double r_m_ip1    = (v_ip1 - v_i) / d1; // r- at i+3/2 (for right state)
+            const double xi_m_ip1   = freezeLimiter ? 1.0 : xi(r_m_ip1);
 
-            const double eps = 1.0;
-            vL = v_i   + (eps/4.0) * ( (1.0-kappa)*xi_p*(v_i   - v_im1) + (1.0+kappa)*xi_m*(v_ip1 - v_i  ) );
-            vR = v_ip1 - (eps/4.0) * ( (1.0-kappa)*xi_m_ip1*(v_ip2 - v_ip1) + (1.0+kappa)*xi_p*(v_ip1 - v_i) );
+            const double eps = 1.0; // 2nd order
+            vL = v_i   + (eps/4.0) * ( (1.0-kappa)*xi_p*(v_i   - v_im1) +
+                                       (1.0+kappa)*xi_m*(v_ip1 - v_i  ) );
+            vR = v_ip1 - (eps/4.0) * ( (1.0-kappa)*xi_m_ip1*(v_ip2 - v_ip1) +
+                                       (1.0+kappa)*xi_p     *(v_ip1 - v_i  ) );
         }
         return {vL, vR};
     };
 
+    auto gr = [&](int ii,int jj){ return Varr[ii][jj].rho; };
+    auto gu = [&](int ii,int jj){ return Varr[ii][jj].u;   };
+    auto gv = [&](int ii,int jj){ return Varr[ii][jj].v;   };
+    auto gP = [&](int ii,int jj){ return Varr[ii][jj].P;   };
 
-    auto get_rho = [&](int ii,int jj){ return V[ii][jj].rho; };
-    auto get_u   = [&](int ii,int jj){ return V[ii][jj].u;   };
-    auto get_v   = [&](int ii,int jj){ return V[ii][jj].v;   };
-    auto get_P   = [&](int ii,int jj){ return V[ii][jj].P;   };
-
-    auto [rhoL,rhoR] = recon_scalar(get_rho);
-    auto [uL,uR]     = recon_scalar(get_u);
-    auto [vL,vR]     = recon_scalar(get_v);
-    auto [pL,pR]     = recon_scalar(get_P);
+    auto [rhoL,rhoR] = recon_scalar(gr);
+    auto [uL,uR]     = recon_scalar(gu);
+    auto [vL,vR]     = recon_scalar(gv);
+    auto [pL,pR]     = recon_scalar(gP);
 
     WL = {rhoL, uL, vL, pL}; clamp_primitive(WL);
     WR = {rhoR, uR, vR, pR}; clamp_primitive(WR);
 }
 
-
-inline void muscl_reconstruct_j(const std::vector<std::vector<Primitive>>& V,
+// j-face: between cells (i, j-1) and (i, j)
+inline void muscl_reconstruct_j(const std::vector<std::vector<Primitive>>& Varr,
                                 int i, int j_face,
                                 int order, double kappa, bool freezeLimiter,
                                 Primitive& WB, Primitive& WT)
 {
-    const int J = (int)V[0].size();
+    const int J = (int)Varr[0].size();
     const int jb = j_face - 1;   // bottom cell
     const int jt = j_face;       // top cell
 
     auto recon_scalar = [&](auto getter)->std::pair<double,double>{
         const double v_j   = getter(i, jb);
         const double v_jp1 = getter(i, jt);
+        double vB = v_j, vT = v_jp1;
 
-        if (order == 2 && jb-1 >= 0 && jt+1 < J) {
+        if (order == 2 && jb-1 >= 0 && jt+1 < J){
             const double v_jm1 = getter(i, jb-1);
             const double v_jp2 = getter(i, jt+1);
 
-            const double d0   = safeDenom(v_jp1 - v_j);
-            const double r_p  = (v_jp2 - v_jp1) / d0;      // r+ at j+1/2
-            const double r_m  = (v_j   - v_jm1) / d0;      // r- at j+1/2
+            const double d0  = safeDenom(v_jp1 - v_j);
+            const double r_p = (v_jp2 - v_jp1) / d0; // r+ at j+1/2
+            const double r_m = (v_j   - v_jm1) / d0; // r- at j+1/2
             const double xi_p = freezeLimiter ? 1.0 : xi(r_p);
             const double xi_m = freezeLimiter ? 1.0 : xi(r_m);
 
-            const double d1       = safeDenom(v_jp2 - v_jp1);
-            const double r_m_jp1  = (v_jp1 - v_j) / d1;    // r- at j+3/2
-            const double xi_m_jp1 = freezeLimiter ? 1.0 : xi(r_m_jp1);
+            const double d1        = safeDenom(v_jp2 - v_jp1);
+            const double r_m_jp1   = (v_jp1 - v_j) / d1;  // r- at j+3/2
+            const double xi_m_jp1  = freezeLimiter ? 1.0 : xi(r_m_jp1);
 
-            const double eps = 1.0;
-            double vB = v_j   + (eps/4.0)*((1.0-kappa)*xi_p*(v_j   - v_jm1) +
-                                           (1.0+kappa)*xi_m*(v_jp1 - v_j));
-            double vT = v_jp1 - (eps/4.0)*((1.0-kappa)*xi_m_jp1*(v_jp2 - v_jp1) +
-                                           (1.0+kappa)*xi_p     *(v_jp1 - v_j));
-            return {vB, vT};
+            const double eps = 1.0; // 2nd order
+            vB = v_j   + (eps/4.0)*((1.0-kappa)*xi_p*(v_j   - v_jm1) +
+                                    (1.0+kappa)*xi_m*(v_jp1 - v_j  ));
+            vT = v_jp1 - (eps/4.0)*((1.0-kappa)*xi_m_jp1*(v_jp2 - v_jp1) +
+                                    (1.0+kappa)*xi_p     *(v_jp1 - v_j  ));
         }
-        return std::pair<double,double>{v_j, v_jp1};
+        return std::pair<double,double>{vB, vT};
     };
 
-    auto get_rho = [&](int ii,int jj){ return V[ii][jj].rho; };
-    auto get_u   = [&](int ii,int jj){ return V[ii][jj].u;   };
-    auto get_v   = [&](int ii,int jj){ return V[ii][jj].v;   };
-    auto get_P   = [&](int ii,int jj){ return V[ii][jj].P;   };
+    auto gr = [&](int ii,int jj){ return Varr[ii][jj].rho; };
+    auto gu = [&](int ii,int jj){ return Varr[ii][jj].u;   };
+    auto gv = [&](int ii,int jj){ return Varr[ii][jj].v;   };
+    auto gP = [&](int ii,int jj){ return Varr[ii][jj].P;   };
 
-    auto [rhoB,rhoT] = recon_scalar(get_rho);
-    auto [uB,uT]     = recon_scalar(get_u);
-    auto [vBv,vTv]   = recon_scalar(get_v);
-    auto [pB,pT]     = recon_scalar(get_P);
+    auto [rhoB,rhoT] = recon_scalar(gr);
+    auto [uB,uT]     = recon_scalar(gu);
+    auto [vBv,vTv]   = recon_scalar(gv);
+    auto [pB,pT]     = recon_scalar(gP);
 
     WB = {rhoB, uB, vBv, pB}; clamp_primitive(WB);
     WT = {rhoT, uT, vTv, pT}; clamp_primitive(WT);
 }
 
-
-// ---- Compute normal fluxes (per unit length) on all faces ----
-// Fi: size (imax+1+2g) x (jmax+2g)    (i-faces)
-// Fj: size (imax+2g)   x (jmax+1+2g)  (j-faces)
-// We only fill usable interior/ghost-interior faces: i=1..I-1, j=0..J-1 and j=1..J-1, i=0..I-1.
-void compute_fluxes_vl(const std::vector<std::vector<Primitive>>& V,
+//------------------------------------------------------------------------------
+// Compute normal fluxes (per unit length) on all faces
+// Fi: (imax+1+2g) x (jmax+2g)   (i-faces)
+// Fj: (imax+2g)   x (jmax+1+2g) (j-faces)
+//------------------------------------------------------------------------------
+void compute_fluxes_vl(const std::vector<std::vector<Primitive>>& Varr,
                        const std::vector<std::vector<double>>& nx_face_i,
                        const std::vector<std::vector<double>>& ny_face_i,
                        const std::vector<std::vector<double>>& nx_face_j,
@@ -1122,36 +1164,36 @@ void compute_fluxes_vl(const std::vector<std::vector<Primitive>>& V,
     const int I = imax + 2*ghost;
     const int J = jmax + 2*ghost;
 
-    Fi.assign(I+1, std::vector<Conserved>(J, {0,0,0,0}));
-    Fj.assign(I,   std::vector<Conserved>(J+1, {0,0,0,0}));
+    Fi.assign(I+1, std::vector<Conserved>(J, {0.0,0.0,0.0,0.0}));
+    Fj.assign(I,   std::vector<Conserved>(J+1,{0.0,0.0,0.0,0.0}));
 
-    // i-faces: between cells (i-1,j) and (i,j); use MUSCL along i
-    for (int j=0; j<J; ++j){
-        for (int i=1; i<=I-1; ++i){
+    // i-faces: between (i-1,j) and (i,j)
+    for (int j = 0; j < J; ++j) {
+        for (int i = 1; i <= I-1; ++i) {
             Primitive WL, WR;
-            // fall back to 1st-order at very outer bands to avoid out-of-range
-            const bool ok2 = (order==2 && i-2>=0 && i+1<I);
-            if (ok2) muscl_reconstruct_i(V, i, j, 2, kappa, freezeLimiter, WL, WR);
-            else     { WL = V[i-1][j]; WR = V[i][j]; clamp_primitive(WL); clamp_primitive(WR); }
+            const bool ok2 = (order==2 && i-1-1 >= 0 && i+1 < I); // enough stencil
+            if (ok2) muscl_reconstruct_i(Varr, i, j, 2, kappa, freezeLimiter, WL, WR);
+            else { WL = Varr[i-1][j]; WR = Varr[i][j]; clamp_primitive(WL); clamp_primitive(WR); }
 
             const double nx = nx_face_i[i][j], ny = ny_face_i[i][j];
-            Fi[i][j] = vl_flux_n(WL, WR, nx, ny); // per unit length
+            Fi[i][j] = ComputeFaceFluxVanLeerFirstOrderNormal(WL, WR, nx, ny);
         }
     }
 
-    // j-faces: between cells (i,j-1) and (i,j); use MUSCL along j
-    for (int j=1; j<=J-1; ++j){
-        for (int i=0; i<I; ++i){
+    // j-faces: between (i,j-1) and (i,j)
+    for (int j = 1; j <= J-1; ++j) {
+        for (int i = 0; i < I; ++i) {
             Primitive WB, WT;
-            const bool ok2 = (order==2 && j-2>=0 && j+1<J);
-            if (ok2) muscl_reconstruct_j(V, i, j, 2, kappa, freezeLimiter, WB, WT);
-            else     { WB = V[i][j-1]; WT = V[i][j]; clamp_primitive(WB); clamp_primitive(WT); }
+            const bool ok2 = (order==2 && j-1-1 >= 0 && j+1 < J); // enough stencil
+            if (ok2) muscl_reconstruct_j(Varr, i, j, 2, kappa, freezeLimiter, WB, WT);
+            else { WB = Varr[i][j-1]; WT = Varr[i][j]; clamp_primitive(WB); clamp_primitive(WT); }
 
             const double nx = nx_face_j[i][j], ny = ny_face_j[i][j];
-            Fj[i][j] = vl_flux_n(WB, WT, nx, ny); // per unit length
+            Fj[i][j] = ComputeFaceFluxVanLeerFirstOrderNormal(WB, WT, nx, ny);
         }
     }
 }
+
 
 // 1) flux divergence -> R (Fi,Fj are per-unit-length)
 void add_flux_divergence_to_R(
@@ -1216,10 +1258,10 @@ void add_mms_source_to_R(int mmsCase, double L,
         for (int i=ghost; i<I-ghost; ++i){
             const double x = x_cell[i][j], y = y_cell[i][j];
             // NOTE: subtract S * Vol (was +=)
-            R[i][j].rho  += rmassconv (mmsCase, L, x, y) * Vol[i][j];
-            R[i][j].rhou += xmtmconv  (mmsCase, L, x, y) * Vol[i][j];
-            R[i][j].rhov += ymtmconv  (mmsCase, L, x, y) * Vol[i][j];
-            R[i][j].E    += energyconv(mmsCase, gamma, L, x, y) * Vol[i][j];
+            R[i][j].rho  -= rmassconv (mmsCase, L, x, y) * Vol[i][j];
+            R[i][j].rhou -= xmtmconv  (mmsCase, L, x, y) * Vol[i][j];
+            R[i][j].rhov -= ymtmconv  (mmsCase, L, x, y) * Vol[i][j];
+            R[i][j].E    -= energyconv(mmsCase, gamma, L, x, y) * Vol[i][j];
         }
     }
 }
@@ -1620,7 +1662,7 @@ int main() {
     // --------------- mesh / geometry ---------------
     const std::string meshFile =
         R"(G:\Shared drives\AOE Lab7\Monica Shanmugam\MS\CFD Proj Grids\Grids\curviliniear-grids\curv2d9.grd)";
-    const bool debugMode = false;
+    const bool debugMode = true;
 
     // geometry containers
     std::vector<std::vector<double>>
