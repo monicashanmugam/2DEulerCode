@@ -2,12 +2,12 @@
   "version": "0.2.0",
   "configurations": [
     {
-      "name": "cppdbg: 2DEulerCode.exe",
+      "name": "cppdbg: run active file exe",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/2DEulerCode.exe",
+      "program": "${fileDirname}/${fileBasenameNoExtension}.exe",
       "args": [],
-      "cwd": "${workspaceFolder}",
+      "cwd": "${fileDirname}",
       "stopAtEntry": false,
       "externalConsole": false,
       "MIMode": "gdb",

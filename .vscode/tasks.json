@@ -11,12 +11,12 @@
                 "-O0",
                 "-Wall",
                 "-Wextra",
-                "2DEulerCode.cpp",
+                "${file}",
                 "-o",
-                "${workspaceFolder}/2DEulerCode.exe"
+                "${fileDirname}/${fileBasenameNoExtension}.exe"
             ],
             "options": {
-                "cwd": "${workspaceFolder}"
+                "cwd": "${fileDirname}"
             },
             "problemMatcher": [
                 "$gcc"
