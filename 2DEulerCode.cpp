@@ -26,7 +26,7 @@ constexpr double L     = 1.0;     // domain length
 
 static constexpr int ghost = 2;
 
-const double CFL       = 0.1;    // CFL number for time step control
+const double CFL       = 0.7;  // CFL number for time step control
 const double epsM      = 0.01;    // Minimum Mach number allowed
 const double tolerance = 1e-12;
 const double delta     = 1e-6;    // small number used in limiters, etc.
@@ -36,6 +36,14 @@ std::vector<std::vector<double>> x_node;
 std::vector<std::vector<double>> y_node;
 
 static_assert(ghost >= 2, "MUSCL reconstruction needs at least 2 ghost cells.");
+
+constexpr double wvel0 = 0.0;  // z-velocity is zero in 2D MMS
+
+
+// ======= MMS debug switches =======
+bool g_use_clamps = false;          // OFF during MMS validation
+bool g_run_discrete_mms_test = false;
+
 //-----------------------------------------------------
 // Primitive & Conserved
 //-----------------------------------------------------
@@ -92,6 +100,8 @@ inline Conserved& operator+=(Conserved& a, const Conserved& b) {
 inline Conserved& operator-=(Conserved& a, const Conserved& b) {
     a.rho  -= b.rho;  a.rhou -= b.rhou;  a.rhov -= b.rhov;  a.E -= b.E; return a;
 }
+
+
 
 //-----------------------------------------------------
 // Physical bounds (primitives)
@@ -227,7 +237,7 @@ void GlobalConservedToPrimitive() {
         for (int j = 0; j < Nj; ++j)
             V[i][j] = ConservedToPrimitiveCell(U[i][j]);
 
-    ApplyLimitsToPrimitive("after U→V", V);
+    if (g_use_clamps) ApplyLimitsToPrimitive("after U→V", V);
 }
 
 void GlobalPrimitiveToConserved() {
@@ -237,7 +247,8 @@ void GlobalPrimitiveToConserved() {
         for (int j = 0; j < Nj; ++j)
             U[i][j] = PrimitiveToConserved(V[i][j]);
 
-    ApplyLimitsToConserved("after V→U", U);
+    if (g_use_clamps) ApplyLimitsToConserved("after V→U", U);
+
 }
 
 
@@ -636,7 +647,7 @@ inline const MmsParams& Csel(int mmsCase) {
 
 inline double rho_mms(int mmsCase, double L, double x, double y) {
     const auto& C = Csel(mmsCase);
-    // rho0 + rhox*sin(pi*x/L) + rhoy*cos(pi*y/(2L))
+    // rho0 + C.rho_x*sin(pi*x/L) + C.rho_y*cos(pi*y/(2L))
     return C.rho0
          + C.rho_x * std::sin((PI * x) / L)
          + C.rho_y * std::cos((PI * y) / (2.0 * L));
@@ -644,7 +655,7 @@ inline double rho_mms(int mmsCase, double L, double x, double y) {
 
 inline double uvel_mms(int mmsCase, double L, double x, double y) {
     const auto& C = Csel(mmsCase);
-    // u0 + uvelx*sin(3pi*x/(2L)) + uvely*cos(3pi*y/(5L))
+    // u0 + C.u_x*sin(3pi*x/(2L)) + C.u_y*cos(3pi*y/(5L))
     return C.u0
          + C.u_x * std::sin((3.0 * PI * x) / (2.0 * L))
          + C.u_y * std::cos((3.0 * PI * y) / (5.0 * L));
@@ -652,7 +663,7 @@ inline double uvel_mms(int mmsCase, double L, double x, double y) {
 
 inline double vvel_mms(int mmsCase, double L, double x, double y) {
     const auto& C = Csel(mmsCase);
-    // v0 + vvelx*cos(pi*x/(2L)) + vvely*sin(2pi*y/(3L))
+    // v0 + C.v_x*cos(pi*x/(2L)) + C.v_y*sin(2pi*y/(3L))
     return C.v0
          + C.v_x * std::cos((PI * x) / (2.0 * L))
          + C.v_y * std::sin((2.0 * PI * y) / (3.0 * L));
@@ -660,7 +671,7 @@ inline double vvel_mms(int mmsCase, double L, double x, double y) {
 
 inline double press_mms(int mmsCase, double L, double x, double y) {
     const auto& C = Csel(mmsCase);
-    // press0 + pressx*cos(2pi*x/L) + pressy*sin(pi*y/L)
+    // C.p0 + C.p_x*cos(2pi*x/L) + C.p_y*sin(pi*y/L)
     return C.p0
          + C.p_x * std::cos((2.0 * PI * x) / L)
          + C.p_y * std::sin((PI * y) / L);
@@ -732,107 +743,141 @@ inline double ymtmconv(int mmsCase, double L, double x, double y) {
 }
 
 
-inline double energyconv(int mmsCase, double gamma, double L, double x, double y, double w0 = 0.0)
+// Assuming CStruct is the structure that holds your variables
+inline double energyconv(int mmsCase, double gamma, double L, double x, double y)
 {
     const auto& C = Csel(mmsCase);
 
-    // Primitives from your MMS definitions
-    const double rho = C.rho0
-        + C.rho_x * std::sin(PI * x / L)
-        + C.rho_y * std::cos(PI * y / (2.0 * L));
+    double wvel0 = 0.0;
 
-    const double u = C.u0
-        + C.u_x * std::sin(3.0 * PI * x / (2.0 * L))
-        + C.u_y * std::cos(3.0 * PI * y / (5.0 * L));
+    double value =  (C.u0 + C.u_y*std::cos((3*PI*y)/(5.*L)) + 
+          C.u_x*std::sin((3*PI*x)/(2.*L)))*
+        ((-2*PI*C.p_x*std::sin((2*PI*x)/L))/L + 
+          (C.rho0 + C.rho_y*std::cos((PI*y)/(2.*L)) + 
+             C.rho_x*std::sin((PI*x)/L))*
+           ((-2*PI*C.p_x*std::sin((2*PI*x)/L))/
+              ((-1 + gamma)*L*
+                (C.rho0 + C.rho_y*std::cos((PI*y)/(2.*L)) + 
+                  C.rho_x*std::sin((PI*x)/L))) + 
+             ((3*PI*C.u_x*std::cos((3*PI*x)/(2.*L))*
+                   (C.u0 + C.u_y*std::cos((3*PI*y)/(5.*L)) + 
+                     C.u_x*std::sin((3*PI*x)/(2.*L))))/L - 
+                (PI*C.v_x*std::sin((PI*x)/(2.*L))*
+                   (C.v0 + C.v_x*std::cos((PI*x)/(2.*L)) + 
+                     C.v_y*std::sin((2*PI*y)/(3.*L))))/L)/2. - 
+             (PI*C.rho_x*std::cos((PI*x)/L)*
+                (C.p0 + C.p_x*std::cos((2*PI*x)/L) + 
+                  C.p_y*std::sin((PI*y)/L)))/
+              ((-1 + gamma)*L*std::pow(C.rho0 + C.rho_y*std::cos((PI*y)/(2.*L)) +  C.rho_x*std::sin((PI*x)/L),2 ))) + 
+          (PI*C.rho_x*std::cos((PI*x)/L)*
+             ((wvel0*wvel0 +
+        std::pow( (C.u0 + C.u_y*std::cos((3*PI*y)/(5.*L)) + 
+                     C.u_x*std::sin((3*PI*x)/(2.*L))),2)+
+        std::pow( (C.v0 + C.v_x*std::cos((PI*x)/(2.*L)) + 
+                     C.v_y*std::sin((2*PI*y)/(3.*L))),2))/2. + 
+               (C.p0 + C.p_x*std::cos((2*PI*x)/L) + 
+                  C.p_y*std::sin((PI*y)/L))/
+                ((-1 + gamma)*
+                  (C.rho0 + C.rho_y*std::cos((PI*y)/(2.*L)) + 
+                    C.rho_x*std::sin((PI*x)/L)))))/L) + 
+       (3*PI*C.u_x*std::cos((3*PI*x)/(2.*L))*
+          (C.p0 + C.p_x*std::cos((2*PI*x)/L) + 
+            C.p_y*std::sin((PI*y)/L) + 
+            (C.rho0 + C.rho_y*std::cos((PI*y)/(2.*L)) + 
+               C.rho_x*std::sin((PI*x)/L))*
+             ((wvel0*wvel0 +
+      std::pow((C.u0 + C.u_y*std::cos((3*PI*y)/(5.*L)) + 
+                     C.u_x*std::sin((3*PI*x)/(2.*L))),2) + 
+      std::pow((C.v0 + C.v_x*std::cos((PI*x)/(2.*L)) + 
+                     C.v_y*std::sin((2*PI*y)/(3.*L))),2))/2. + 
+               (C.p0 + C.p_x*std::cos((2*PI*x)/L) + 
+                  C.p_y*std::sin((PI*y)/L))/
+                ((-1 + gamma)*
+                  (C.rho0 + C.rho_y*std::cos((PI*y)/(2.*L)) + 
+                    C.rho_x*std::sin((PI*x)/L))))))/(2.*L) + 
+       (2*PI*C.v_y*std::cos((2*PI*y)/(3.*L))*
+          (C.p0 + C.p_x*std::cos((2*PI*x)/L) + 
+            C.p_y*std::sin((PI*y)/L) + 
+            (C.rho0 + C.rho_y*std::cos((PI*y)/(2.*L)) + 
+               C.rho_x*std::sin((PI*x)/L))*
+             ((wvel0*wvel0 +
+       std::pow(  (C.u0 + C.u_y*std::cos((3*PI*y)/(5.*L)) + 
+                     C.u_x*std::sin((3*PI*x)/(2.*L))),2) + 
+       std::pow(  (C.v0 + C.v_x*std::cos((PI*x)/(2.*L)) + 
+                     C.v_y*std::sin((2*PI*y)/(3.*L))),2))/2. + 
+               (C.p0 + C.p_x*std::cos((2*PI*x)/L) + 
+                  C.p_y*std::sin((PI*y)/L))/
+                ((-1 + gamma)*
+                  (C.rho0 + C.rho_y*std::cos((PI*y)/(2.*L)) + 
+                    C.rho_x*std::sin((PI*x)/L))))))/(3.*L) + 
+       (C.v0 + C.v_x*std::cos((PI*x)/(2.*L)) + 
+          C.v_y*std::sin((2*PI*y)/(3.*L)))*
+        ((PI*C.p_y*std::cos((PI*y)/L))/L - 
+          (PI*C.rho_y*std::sin((PI*y)/(2.*L))*
+             ((wvel0*wvel0 +
+        std::pow(  (C.u0 + C.u_y*std::cos((3*PI*y)/(5.*L)) + 
+                     C.u_x*std::sin((3*PI*x)/(2.*L))),2) + 
+        std::pow( (C.v0 + C.v_x*std::cos((PI*x)/(2.*L)) + 
+                     C.v_y*std::sin((2*PI*y)/(3.*L))),2))/2. + 
+               (C.p0 + C.p_x*std::cos((2*PI*x)/L) + 
+                  C.p_y*std::sin((PI*y)/L))/
+                ((-1 + gamma)*
+                  (C.rho0 + C.rho_y*std::cos((PI*y)/(2.*L)) + 
+                    C.rho_x*std::sin((PI*x)/L)))))/(2.*L) + 
+          (C.rho0 + C.rho_y*std::cos((PI*y)/(2.*L)) + 
+             C.rho_x*std::sin((PI*x)/L))*
+           ((PI*C.p_y*std::cos((PI*y)/L))/
+              ((-1 + gamma)*L*
+                (C.rho0 + C.rho_y*std::cos((PI*y)/(2.*L)) + 
+                  C.rho_x*std::sin((PI*x)/L))) + 
+             ((-6*PI*C.u_y*
+                   (C.u0 + C.u_y*std::cos((3*PI*y)/(5.*L)) + 
+                     C.u_x*std::sin((3*PI*x)/(2.*L)))*
+                   std::sin((3*PI*y)/(5.*L)))/(5.*L) + 
+                (4*PI*C.v_y*std::cos((2*PI*y)/(3.*L))*
+                   (C.v0 + C.v_x*std::cos((PI*x)/(2.*L)) + 
+                     C.v_y*std::sin((2*PI*y)/(3.*L))))/(3.*L))/
+              2. + (PI*C.rho_y*std::sin((PI*y)/(2.*L))*
+                (C.p0 + C.p_x*std::cos((2*PI*x)/L) + 
+                  C.p_y*std::sin((PI*y)/L)))/
+              (2.*(-1 + gamma)*L*
+      std::pow( (C.rho0 + C.rho_y*std::cos((PI*y)/(2.*L)) + 
+                   C.rho_x*std::sin((PI*x)/L)),2))));
 
-    const double v = C.v0
-        + C.v_x * std::cos(PI * x / (2.0 * L))
-        + C.v_y * std::sin(2.0 * PI * y / (3.0 * L));
+    return value;
 
-    const double p = C.p0
-        + C.p_x * std::cos(2.0 * PI * x / L)
-        + C.p_y * std::sin(PI * y / L);
-
-    // Specific total energy (include w0 if your MMS has it)
-    const double vel2 = u*u + v*v + w0*w0;
-    const double Eeq  = 0.5 * vel2 + p / ((gamma - 1.0) * rho);
-
-    // ----- u * [ ... ]  -----
-    // - (2π pressx sin(2πx/L))/L
-    const double A_x = -2.0 * PI * C.p_x * std::sin(2.0 * PI * x / L) / L;
-
-    // + rho * [ -(2π pressx sin(2πx/L))/((γ-1)L ρ)  +  1/2 * ( 1/L * (3π u_x cos(...) * u) - 1/L * (π v_x sin(...) * v) ) ]
-    const double vel_x_part = ( 3.0 * PI * C.u_x * std::cos(3.0 * PI * x / (2.0 * L)) * u
-                              -       PI * C.v_x * std::sin(      PI * x / (2.0 * L)) * v ) / L;
-    const double B_x = rho * ( -2.0 * PI * C.p_x * std::sin(2.0 * PI * x / L) / ((gamma - 1.0) * L * rho)
-                               + 0.5 * vel_x_part );
-
-    // - (π rhox cos(πx/L) * p) / ( (γ-1) L ρ^2 )
-    const double C_x = - PI * C.rho_x * std::cos(PI * x / L) * p / ((gamma - 1.0) * L * rho * rho);
-
-    const double term_u = u * (A_x + B_x + C_x);
-
-    // + (π rhox cos(πx/L))/L * Eeq
-    const double term_rhox_E = (PI * C.rho_x * std::cos(PI * x / L) / L) * Eeq;
-
-    // + (3π u_x cos(3πx/(2L)))/(2L) * (p + ρ Eeq)
-    const double term_ux = (3.0 * PI * C.u_x * std::cos(3.0 * PI * x / (2.0 * L)) / (2.0 * L)) * (p + rho * Eeq);
-
-    // + (2π v_y cos(2πy/(3L)))/(3L) * (p + ρ Eeq)
-    const double term_vy = (2.0 * PI * C.v_y * std::cos(2.0 * PI * y / (3.0 * L)) / (3.0 * L)) * (p + rho * Eeq);
-
-    // ----- v * [ ... ]  -----
-    // (π pressy cos(πy/L))/L
-    const double Ay = (PI * C.p_y * std::cos(PI * y / L)) / L;
-
-    // - (π rhoy sin(πy/(2L)))/(2L) * Eeq
-    const double Ey = - (PI * C.rho_y * std::sin(PI * y / (2.0 * L)) / (2.0 * L)) * Eeq;
-
-    // + rho * [ (π pressy cos(πy/L))/((γ-1)L ρ)
-    //           + 1/2 * ( - (6π u_y u sin(3πy/(5L)))/(5L) + (4π v_y v cos(2πy/(3L)))/(3L) )
-    //           + (π rhoy sin(πy/(2L)) p)/(2 (γ-1) L ρ^2) ]
-    const double y_vel_part = - (6.0 * PI * C.u_y * u * std::sin(3.0 * PI * y / (5.0 * L))) / (5.0 * L)
-                              + (4.0 * PI * C.v_y * v * std::cos(2.0 * PI * y / (3.0 * L))) / (3.0 * L);
-
-    const double bracket_y = (PI * C.p_y * std::cos(PI * y / L)) / ((gamma - 1.0) * L * rho)
-                           + 0.5 * y_vel_part
-                           + (PI * C.rho_y * std::sin(PI * y / (2.0 * L)) * p) / (2.0 * (gamma - 1.0) * L * rho * rho);
-
-    const double term_v = v * ( Ay + Ey + rho * bracket_y );
-
-    // Sum
-    return term_u + term_rhox_E + term_ux + term_vy + term_v;
 }
+
+
 
 
 void init_mms_fs(int mmsCase, double L,
                  const std::vector<std::vector<double>>& x_cell,
                  const std::vector<std::vector<double>>& y_cell)
 {
-    const auto& C = (mmsCase==1 ? mmsSup : mmsSub);
-    const Primitive Wfs{ C.rho0, C.u0, C.v0, C.p0 };
+    const int I = imax + 2*ghost;
+    const int J = jmax + 2*ghost;
 
-    const int I = imax + 2*ghost, J = jmax + 2*ghost;
-    V.assign(I, std::vector<Primitive>(J)); // no freestream yet
+    V.assign(I, std::vector<Primitive>(J));
 
-    // 1) interior = MMS (cell centers)
-    for (int j = ghost; j < J-ghost; ++j)
-      for (int i = ghost; i < I-ghost; ++i) {
-        const double x = x_cell[i][j], y = y_cell[i][j];
-        V[i][j].rho = rho_mms (mmsCase, L, x, y);
-        V[i][j].u   = uvel_mms(mmsCase, L, x, y);
-        V[i][j].v   = vvel_mms(mmsCase, L, x, y);
-        V[i][j].P   = press_mms(mmsCase, L, x, y);
-      }
+    // Fill MMS at every cell center, including ghosts.
+    for (int j = 0; j < J; ++j){
+        for (int i = 0; i < I; ++i){
+            const double x = x_cell[i][j];
+            const double y = y_cell[i][j];
+            V[i][j].rho = rho_mms (mmsCase, L, x, y);
+            V[i][j].u   = uvel_mms(mmsCase, L, x, y);
+            V[i][j].v   = vvel_mms(mmsCase, L, x, y);
+            V[i][j].P   = press_mms(mmsCase, L, x, y);
+        }
+    }
 
-    // 2) ghosts = freestream (all four belts, incl. corners)
-    auto setg = [&](int i,int j){ V[i][j] = Wfs; };
-    for (int j=0;j<J;++j) for (int q=0;q<ghost;++q){ setg(       q ,j); setg(I-1-q,j); }
-    for (int i=0;i<I;++i) for (int q=0;q<ghost;++q){ setg(i,       q ); setg(i, J-1-q); }
+    // (Optional) keep clamps OFF during MMS validation.
+    // ApplyLimitsToPrimitive("init_mms_fs", V);
 
-    ApplyLimitsToPrimitive("init_mms_fs", V);
-    GlobalPrimitiveToConserved();
+    GlobalPrimitiveToConserved();  // builds U consistently from V
 }
+
 
 // BC: Dirichlet MMS on ghost belts (evaluate at ghost cell centers)
 // call this before computing fluxes / each RK stage
@@ -1244,6 +1289,35 @@ void add_flux_divergence_to_R(
     }
 }
 
+// Cell-loop version: net = Fr - Fl + Ft - Fb (interior only)
+void add_flux_divergence_to_R_cellloop(
+    const std::vector<std::vector<Conserved>>& Fi,
+    const std::vector<std::vector<Conserved>>& Fj,
+    const std::vector<std::vector<double>>& A_face_i,
+    const std::vector<std::vector<double>>& A_face_j,
+    std::vector<std::vector<Conserved>>& R)
+{
+    const int I = imax + 2*ghost, J = jmax + 2*ghost;
+    R.assign(I, std::vector<Conserved>(J, {0,0,0,0}));
+
+    for (int j = ghost; j < J - ghost; ++j){
+        for (int i = ghost; i < I - ghost; ++i){
+            auto add = [&](const Conserved &f, double s){
+                R[i][j].rho  += s * f.rho;
+                R[i][j].rhou += s * f.rhou;
+                R[i][j].rhov += s * f.rhov;
+                R[i][j].E    += s * f.E;
+            };
+            // right (i+1/2), left (i-1/2), top (j+1/2), bottom (j-1/2)
+            add(Fi[i+1][j], +A_face_i[i+1][j]); // Fr
+            add(Fi[i  ][j], -A_face_i[i  ][j]); // Fl
+            add(Fj[i][j+1], +A_face_j[i][j+1]); // Ft
+            add(Fj[i][j  ], -A_face_j[i][j  ]); // Fb
+        }
+    }
+}
+
+
 
 // 2) add MMS source at cell centers (interior only)
 // 2) add MMS source at cell centers (interior only)
@@ -1293,8 +1367,9 @@ void build_rhs(int mmsCase, double L,
                       order, kappa, freezeLimiter, Fi, Fj);
 
     // 3) residual from fluxes × areas
-    std::vector<std::vector<Conserved>> R(I, std::vector<Conserved>(J, {0,0,0,0}));
-    add_flux_divergence_to_R(Fi, Fj, A_face_i, A_face_j, R);
+    std::vector<std::vector<Conserved>> R;
+    add_flux_divergence_to_R_cellloop(Fi, Fj, A_face_i, A_face_j, R);
+
 
     // 4) add MMS sources at cell centers (interior only)
     add_mms_source_to_R(mmsCase, L, x_cell, y_cell, Vol, R);
@@ -1310,6 +1385,8 @@ void build_rhs(int mmsCase, double L,
         }
     }
 }
+
+
 
 // Returns the dt it used (you pass dt in).
 double rk2_step(double dt, int mmsCase, double L,
@@ -1368,8 +1445,7 @@ double rk2_step(double dt, int mmsCase, double L,
         }
     }
     GlobalConservedToPrimitive();
-    ApplyLimitsToConserved("rk2_step", U);  // optional safety
-    ApplyLimitsToPrimitive("rk2_step", V);
+    
 
     return dt;
 }
@@ -1539,6 +1615,7 @@ inline void print_residuals(const std::vector<std::vector<Conserved>>& G,
               << "\n";
 }
 
+
 // Writes a Tecplot BLOCK zone. If writeGhosts=true, it writes the padded grid
 // (nodes with ghosts) + all cell-centered fields including ghosts.
 // Adds a cell-centered "ghost" mask: 1 in ghost belt, 0 in physical interior.
@@ -1643,11 +1720,11 @@ void OutputSolution2D(const std::string &filename, int iter, bool writeGhosts=fa
 
 int main() {
     // --------------- run controls ---------------
-    const int    fluxOrder     = 1;      // 1 or 2 (MUSCL)
-    const double kappa         = 0.0;    // MUSCL κ in [-1,1]
-    const bool   freezeLimiter = false;  // true => no limiting (ξ=1)
-    const bool   useRK4        = false;  // false->RK2, true->RK4
-    const int    maxIter       = 1000;
+    const int    fluxOrder     = 2;      // 1 or 2 (MUSCL)
+    const double kappa         = -1;    // MUSCL κ in [-1,1]
+    const bool   freezeLimiter = true;  // true => no limiting (ξ=1)
+    const bool   useRK4        = true;  // false->RK2, true->RK4
+    const int    maxIter       = 2000;
     const int    writeEvery    = 50;     // Tecplot frequency
 
     // --------------- output file ---------------
@@ -1661,8 +1738,8 @@ int main() {
 
     // --------------- mesh / geometry ---------------
     const std::string meshFile =
-        R"(G:\Shared drives\AOE Lab7\Monica Shanmugam\MS\CFD Proj Grids\Grids\curviliniear-grids\curv2d9.grd)";
-    const bool debugMode = true;
+        R"(G:\Shared drives\AOE Lab7\Monica Shanmugam\MS\CFD Proj Grids\Grids\curviliniear-grids\curv2d17.grd)";
+    const bool debugMode = false;
 
     // geometry containers
     std::vector<std::vector<double>>
@@ -1746,6 +1823,8 @@ int main() {
     // write both zones at iter=0
     OutputSolution2D(solFile, /*iter=*/0, /*writeGhosts=*/false);
     OutputSolution2D(solFile, /*iter=*/0, /*writeGhosts=*/true);
+
+
 
     // --------------- time loop ---------------
     for (int iter = 1; iter <= maxIter; ++iter) {
